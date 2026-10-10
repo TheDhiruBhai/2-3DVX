@@ -1,0 +1,20 @@
+﻿<Solution>
+  <Project Path="Unity.XR.OpenXR.csproj" />
+  <Project Path="Unity.XR.OpenXR.Editor.Tests.csproj" />
+  <Project Path="UnityEngine.XR.OpenXR.CodeSamples.Editor.Tests.csproj" />
+  <Project Path="Unity.XR.OpenXR.Editor.csproj" />
+  <Project Path="Unity.XR.OpenXR.Features.MetaQuestSupport.Editor.csproj" />
+  <Project Path="Unity.XR.OpenXR.Ubuntu.Tests.csproj" />
+  <Project Path="Assembly-CSharp.csproj" />
+  <Project Path="Unity.XR.OpenXR.Tests.csproj" />
+  <Project Path="Unity.XR.OpenXR.Features.MetaQuestSupport.csproj" />
+  <Project Path="Unity.XR.OpenXR.Features.RuntimeDebugger.csproj" />
+  <Project Path="Unity.XR.OpenXR.Features.OculusQuestSupport.Editor.csproj" />
+  <Project Path="Unity.XR.OpenXR.Features.RuntimeDebugger.Editor.csproj" />
+  <Project Path="Unity.XR.OpenXR.Features.MetaHandMeshData.csproj" />
+  <Project Path="Unity.XR.OpenXR.Features.MetaHandMeshData.Editor.csproj" />
+  <Project Path="Unity.XR.OpenXR.TestTooling.csproj" />
+  <Project Path="Unity.XR.OpenXR.Features.ConformanceAutomation.csproj" />
+  <Project Path="Unity.XR.OpenXR.Features.MockRuntime.csproj" />
+  <Project Path="Unity.XR.OpenXR.Features.OculusQuestSupport.csproj" />
+</Solution>

@@ -1,5 +1,6 @@
 using UnityEngine;
 using VRDraw2Voxel.VoxelMesh;
+using VRDraw2Voxel.Inference;
 
 namespace VRDraw2Voxel.Tests
 {
@@ -22,6 +23,7 @@ namespace VRDraw2Voxel.Tests
         [SerializeField] private float floatFrequency = 1.5f;
 
         [Header("References")]
+        [SerializeField] private ColoredVoxelMesher coloredVoxelMesher;
         [SerializeField] private GreedyVoxelMesher voxelMesher;
 
         private Vector3 _basePosition;
@@ -37,13 +39,19 @@ namespace VRDraw2Voxel.Tests
             holder.transform.SetParent(transform, false);
             _meshHolder = holder.transform;
 
+            if (coloredVoxelMesher == null)
+            {
+                coloredVoxelMesher = GetComponent<ColoredVoxelMesher>() ?? FindFirstObjectByType<ColoredVoxelMesher>();
+            }
+
+            if (coloredVoxelMesher != null)
+            {
+                coloredVoxelMesher.OnColoredMeshConstructed += OnNewColoredMeshConstructed;
+            }
+
             if (voxelMesher == null)
             {
-                voxelMesher = GetComponent<GreedyVoxelMesher>();
-                if (voxelMesher == null)
-                {
-                    voxelMesher = FindFirstObjectByType<GreedyVoxelMesher>();
-                }
+                voxelMesher = GetComponent<GreedyVoxelMesher>() ?? FindFirstObjectByType<GreedyVoxelMesher>();
             }
 
             if (voxelMesher != null)
@@ -54,10 +62,20 @@ namespace VRDraw2Voxel.Tests
 
         private void OnDestroy()
         {
+            if (coloredVoxelMesher != null)
+            {
+                coloredVoxelMesher.OnColoredMeshConstructed -= OnNewColoredMeshConstructed;
+            }
+
             if (voxelMesher != null)
             {
                 voxelMesher.OnWeaponMeshConstructed -= OnNewWeaponConstructed;
             }
+        }
+
+        private void OnNewColoredMeshConstructed(GameObject itemObj, Bounds bounds, MultiTaskInferenceResult result)
+        {
+            OnNewWeaponConstructed(itemObj, bounds);
         }
 
         private void Update()

@@ -17,6 +17,8 @@ namespace VRDraw2Voxel.Tests
     public class MousePaintCanvas : MonoBehaviour
     {
         [Header("Engine References")]
+        [SerializeField] private SentisMultiTaskEngine multiTaskEngine;
+        [SerializeField] private ColoredVoxelMesher coloredVoxelMesher;
         [SerializeField] private SentisVoxelEngine voxelEngine;
         [SerializeField] private GreedyVoxelMesher voxelMesher;
         [SerializeField] private PS2ShowcaseRotator showcaseRotator;
@@ -39,6 +41,13 @@ namespace VRDraw2Voxel.Tests
         private string _lastGeneratedItemName = "Legendary Buster Sword";
         private string _lastCategoryName = "WEAPONS";
 
+        // Multi-Task Tri-View State
+        private ReconstructedCategory _detectedCategory = ReconstructedCategory.Unknown;
+        private float _categoryConfidence = 0f;
+        private PerspectiveView _detectedView = PerspectiveView.Front_XY;
+        private float _viewConfidence = 0f;
+        private bool _isOutOfDistribution = false;
+
         // Multi-Category Tabs & Disclaimer Guide State
         private int _selectedCategoryTab = 0; // 0: Weapons, 1: Toys, 2: Electronics
         private bool _showDisclaimerModal = false;
@@ -49,6 +58,26 @@ namespace VRDraw2Voxel.Tests
         private void Awake()
         {
             InitializeTexture();
+
+            if (multiTaskEngine == null)
+            {
+                multiTaskEngine = FindFirstObjectByType<SentisMultiTaskEngine>();
+                if (multiTaskEngine == null)
+                {
+                    multiTaskEngine = gameObject.AddComponent<SentisMultiTaskEngine>();
+                    Debug.Log("[MousePaintCanvas] Auto-attached SentisMultiTaskEngine to GameObject.");
+                }
+            }
+
+            if (coloredVoxelMesher == null)
+            {
+                coloredVoxelMesher = FindFirstObjectByType<ColoredVoxelMesher>();
+                if (coloredVoxelMesher == null)
+                {
+                    coloredVoxelMesher = gameObject.AddComponent<ColoredVoxelMesher>();
+                    Debug.Log("[MousePaintCanvas] Auto-attached ColoredVoxelMesher to GameObject.");
+                }
+            }
 
             if (voxelEngine == null) voxelEngine = FindFirstObjectByType<SentisVoxelEngine>();
             if (voxelMesher == null) voxelMesher = FindFirstObjectByType<GreedyVoxelMesher>();
@@ -278,15 +307,56 @@ namespace VRDraw2Voxel.Tests
         /// </summary>
         public void Generate3DVoxels()
         {
-            if (voxelEngine == null)
+            float[] inputBuffer = DownsampleTo64x64();
+
+            if (multiTaskEngine != null)
             {
-                _statusMessage = "Error: SentisVoxelEngine not found in scene!";
+                _statusMessage = "Inferring Tri-View Multi-Task 3D Voxels...";
+                multiTaskEngine.PredictMultiTaskAsync(inputBuffer, (result) =>
+                {
+                    _lastInferenceTimeMs = result.latencyMs;
+                    _detectedCategory = result.category;
+                    _categoryConfidence = result.categoryConfidence;
+                    _detectedView = result.detectedView;
+                    _viewConfidence = result.viewConfidence;
+                    _isOutOfDistribution = result.isOutOfDistribution;
+
+                    int count = 0;
+                    for (int i = 0; i < result.occupancyGrid.Length; i++)
+                    {
+                        if (result.occupancyGrid[i] > 0) count++;
+                    }
+                    _lastSolidVoxelCount = count;
+
+                    if (_isOutOfDistribution)
+                    {
+                        _statusMessage = $"<color=#ff6666>[OOD REJECTED ({_categoryConfidence * 100f:F0}%)]</color> Stroke does not match known weapon/object!";
+                    }
+                    else
+                    {
+                        _lastCategoryName = _detectedCategory.ToString().ToUpper();
+                        _statusMessage = $"Reconstructed {_detectedCategory} ({_categoryConfidence * 100f:F0}%) | View: {_detectedView} ({_viewConfidence * 100f:F0}%) | Voxels: {count} | {result.latencyMs:F1}ms";
+                    }
+
+                    if (coloredVoxelMesher != null)
+                    {
+                        coloredVoxelMesher.GenerateColoredMesh(result.occupancyGrid, result.voxelColors);
+                    }
+                    else if (voxelMesher != null)
+                    {
+                        voxelMesher.GenerateMeshFromOccupancy(result.occupancyGrid);
+                    }
+                });
                 return;
             }
 
-            float[] inputBuffer = DownsampleTo64x64();
-            _statusMessage = "Inferring 3D Voxel Mesh...";
+            if (voxelEngine == null)
+            {
+                _statusMessage = "Error: SentisVoxelEngine or SentisMultiTaskEngine not found in scene!";
+                return;
+            }
 
+            _statusMessage = "Inferring 3D Voxel Mesh...";
             float startTime = Time.realtimeSinceStartup;
             voxelEngine.PredictVoxelsAsync(inputBuffer, (voxels) =>
             {
@@ -539,7 +609,7 @@ namespace VRDraw2Voxel.Tests
         {
             // Dark Retro HUD Window
             GUI.color = Color.white;
-            GUI.Box(new Rect(10, 10, 290, 580), "");
+            GUI.Box(new Rect(10, 10, 290, 620), "");
 
             GUI.Label(new Rect(20, 15, 270, 22), "<b>★ DRAW-2-VOXEL MULTI-CATEGORY ★</b>");
             GUI.Label(new Rect(20, 35, 270, 20), "<color=#aaaaaa>Draw 2D sketch with mouse:</color>");
@@ -615,7 +685,17 @@ namespace VRDraw2Voxel.Tests
             btnY += 32;
             autoGenerateOnRelease = GUI.Toggle(new Rect(20, btnY, 250, 18), autoGenerateOnRelease, " Live Reconstruct on Mouse Up");
 
-            btnY += 20;
+            btnY += 22;
+            if (multiTaskEngine != null && _detectedCategory != ReconstructedCategory.Unknown)
+            {
+                string catBadge = _isOutOfDistribution
+                    ? "<color=#ff5555><b>[OOD REJECTED]</b></color>"
+                    : $"<color=#55ff88><b>{_detectedCategory}</b></color> ({_categoryConfidence * 100f:F0}%)";
+                string viewBadge = $"<color=#55ccff><b>{_detectedView}</b></color> ({_viewConfidence * 100f:F0}%)";
+                GUI.Label(new Rect(20, btnY, 260, 20), $"AI Class: {catBadge} | View: {viewBadge}");
+                btnY += 20;
+            }
+
             GUI.Label(new Rect(20, btnY, 260, 36), $"<color=#ffdd66>★ {_lastCategoryName}: {_lastGeneratedItemName}</color>\n<size=10>{_statusMessage}</size>");
 
             // 8. Player Capability & Disclaimer Guide Modal

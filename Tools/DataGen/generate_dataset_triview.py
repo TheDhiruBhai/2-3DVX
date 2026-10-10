@@ -390,8 +390,10 @@ def project_canonical_view(voxel_grid_4ch, view_id):
 
     return proj.astype(np.float32)
 
+import cv2
+
 # ==============================================================================
-# HUMAN SKETCH SIMULATION (Elastic Deform, Stroke Jitter, Pressure, Dropout)
+# MULTI-MODAL HUMAN SKETCH SIMULATION (70% Outlines, 20% Silhouettes, 10% Partial)
 # ==============================================================================
 
 def elastic_transform(image, alpha=6.0, sigma=2.2):
@@ -403,45 +405,62 @@ def elastic_transform(image, alpha=6.0, sigma=2.2):
     indices = np.reshape(y + dy, (-1, 1)), np.reshape(x + dx, (-1, 1))
     return ndimage.map_coordinates(image, indices, order=1, mode='reflect').reshape(shape)
 
-def render_imperfect_sketch(clean_proj):
-    """Transforms a clean 2D projection into a loose, imperfect human drawing."""
-    # 1. Edge extraction to convert solid silhouette into outline stroke
-    struct = ndimage.generate_binary_structure(2, 2)
-    eroded = ndimage.binary_erosion(clean_proj > 0.4, structure=struct)
-    edges = ((clean_proj > 0.4).astype(np.float32) - eroded.astype(np.float32))
+def render_multimodal_sketch(clean_proj):
+    """
+    Transforms clean 2D projections into diverse sketch interaction styles:
+    - 70% Outline / Contour Strokes (morphological gradient, 1-3px stroke width, hollow interior)
+    - 20% Solid Silhouettes (solid binary mask for preset compatibility)
+    - 10% Partial / Incomplete Contours (outlines with random segment dropouts / unclosed loops)
+    All modes include hand tremor (elastic deformation), affine jitter, and stroke pressure variance.
+    Target 3D voxel grid remains 100% solid, training the network to fill hollow interiors.
+    """
+    mode_roll = random.random()
+    binary_mask = (clean_proj > 0.4).astype(np.uint8)
 
-    stroke_style = random.random()
-    if stroke_style < 0.65:
-        # Outline sketch with variable brush thickness
-        stroke = ndimage.binary_dilation(edges, structure=struct, iterations=random.choice([1, 2])).astype(np.float32)
+    if mode_roll < 0.70:
+        # 1. Outline / Contour Stroke (70%)
+        # Randomize stroke width from 1 to 3 px
+        stroke_px = random.choice([1, 2, 3])
+        k = 2 if stroke_px == 1 else (3 if stroke_px == 2 else 4)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+        stroke = cv2.morphologyEx(binary_mask, cv2.MORPH_GRADIENT, kernel).astype(np.float32)
+
+    elif mode_roll < 0.90:
+        # 2. Solid Silhouette (20%)
+        stroke = binary_mask.astype(np.float32)
+
     else:
-        # Loose filled silhouette
-        stroke = clean_proj.copy()
+        # 3. Partial / Incomplete Contour (10%)
+        stroke_px = random.choice([1, 2, 3])
+        k = 2 if stroke_px == 1 else (3 if stroke_px == 2 else 4)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+        stroke = cv2.morphologyEx(binary_mask, cv2.MORPH_GRADIENT, kernel).astype(np.float32)
 
-    # 2. Elastic deformation (hand tremor)
+        # Apply random segment dropouts (erasing boundary segments to simulate unclosed loops)
+        num_dropouts = random.randint(1, 3)
+        for _ in range(num_dropouts):
+            rx = random.randint(10, 54)
+            ry = random.randint(10, 54)
+            rw = random.randint(5, 12)
+            stroke[max(0, rx-rw//2):min(IMAGE_DIM, rx+rw//2), max(0, ry-rw//2):min(IMAGE_DIM, ry+rw//2)] = 0.0
+
+    # 4. Elastic deformation (hand tremor)
     if random.random() < 0.85:
-        stroke = elastic_transform(stroke, alpha=random.uniform(4.0, 7.5), sigma=random.uniform(2.0, 3.0))
+        stroke = elastic_transform(stroke, alpha=random.uniform(4.0, 7.0), sigma=random.uniform(2.0, 2.8))
 
-    # 3. Affine transformations (rotation, translation, scale)
-    angle = random.uniform(-10.0, 10.0)
+    # 5. Affine transformations (rotation, translation)
+    angle = random.uniform(-8.0, 8.0)
     stroke = ndimage.rotate(stroke, angle, reshape=False, order=1, mode='constant', cval=0.0)
 
-    shift_x = random.uniform(-2.5, 2.5)
-    shift_y = random.uniform(-2.5, 2.5)
+    shift_x = random.uniform(-2.0, 2.0)
+    shift_y = random.uniform(-2.0, 2.0)
     stroke = ndimage.shift(stroke, (shift_x, shift_y), order=1, mode='constant', cval=0.0)
 
-    # 4. Stroke thickness jitter (pressure changes)
-    if random.random() < 0.35:
+    # 6. Minor stroke pressure jitter
+    if random.random() < 0.25:
         stroke = ndimage.binary_dilation(stroke > 0.3, iterations=1).astype(np.float32)
-    elif random.random() < 0.20:
+    elif random.random() < 0.15:
         stroke = ndimage.binary_erosion(stroke > 0.4, iterations=1).astype(np.float32)
-
-    # 5. Hand lifting gaps / stroke dropout
-    if random.random() < 0.30:
-        rx = random.randint(12, 50)
-        ry = random.randint(12, 50)
-        rw = random.randint(4, 9)
-        stroke[rx:rx+rw, ry:ry+rw] *= 0.0
 
     stroke = np.clip(stroke, 0.0, 1.0)
     stroke = (stroke > 0.25).astype(np.float32)
@@ -473,7 +492,7 @@ def generate_triview_dataset(num_samples=3300, output_path="Tools/DataGen/datase
         view_id = (i // num_classes) % 3
 
         clean_proj = project_canonical_view(voxel_4ch, view_id)
-        noisy_sketch = render_imperfect_sketch(clean_proj)
+        noisy_sketch = render_multimodal_sketch(clean_proj)
 
         inputs[i, 0] = (noisy_sketch * 255.0).astype(np.uint8)
         

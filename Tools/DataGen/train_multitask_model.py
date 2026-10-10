@@ -137,16 +137,26 @@ class MultiTaskVoxelLoss(nn.Module):
         self.ce_view = nn.CrossEntropyLoss()
 
     def forward(self, pred_vox, pred_cat, pred_view, tgt_vox, tgt_cat, tgt_view):
-        # 1. Occupancy Loss: Channel 0 (BCE + Soft Dice)
+        # 1. Occupancy Loss: Channel 0 (Focal + Soft Dice + BCE)
+        # Forces solid interior volume infilling from hollow boundary outlines while heavily penalizing empty space false positives
         pred_occ = pred_vox[:, 0:1]
         tgt_occ = tgt_vox[:, 0:1]
 
-        bce_loss = self.bce(pred_occ, tgt_occ)
+        eps = 1e-7
+        p_clamped = pred_occ.clamp(eps, 1.0 - eps)
+        # Focal terms: alpha=0.75 for positive interior infilling, gamma=2.0 for hard-example focusing
+        pos_focal = - 0.75 * tgt_occ * ((1.0 - p_clamped) ** 2) * torch.log(p_clamped)
+        neg_focal = - 0.25 * (1.0 - tgt_occ) * (p_clamped ** 2) * torch.log(1.0 - p_clamped)
+        focal_loss = (pos_focal + neg_focal).mean()
+
         p_flat = pred_occ.reshape(-1)
         t_flat = tgt_occ.reshape(-1)
         inter = (p_flat * t_flat).sum()
         dice = (2. * inter + self.smooth) / (p_flat.sum() + t_flat.sum() + self.smooth)
-        occ_loss = bce_loss + 2.0 * (1.0 - dice)
+        dice_loss = 1.0 - dice
+
+        bce_loss = self.bce(pred_occ, tgt_occ)
+        occ_loss = focal_loss + bce_loss + 2.5 * dice_loss
 
         # 2. Color Loss: Channels 1..3 (Masked MSE only on solid voxels)
         pred_rgb = pred_vox[:, 1:4]

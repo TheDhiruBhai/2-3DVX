@@ -64,9 +64,17 @@ namespace VRDraw2Voxel.Inference
         [Range(0.3f, 0.95f)]
         [SerializeField] private float oodConfidenceThreshold = 0.60f;
 
-        [Tooltip("Binary occupancy threshold for voxel decoder.")]
-        [Range(0.2f, 0.8f)]
-        [SerializeField] private float occupancyThreshold = 0.50f;
+        [Header("Occupancy & Island Post-Processing")]
+        [Tooltip("Binary occupancy threshold for voxel decoder. Higher values eliminate boundary floating dust.")]
+        [Range(0.2f, 0.85f)]
+        [SerializeField] private float occupancyThreshold = 0.58f;
+
+        [Tooltip("Enable 3D connected component analysis to reject disconnected voxel islands.")]
+        [SerializeField] private bool filterDisconnectedIslands = true;
+
+        [Tooltip("Minimum voxel cluster size to retain. Disconnected islands smaller than this are purged.")]
+        [Range(1, 32)]
+        [SerializeField] private int minClusterSize = 8;
 
         private Model _runtimeModel;
 #if UNITY_6000_0_OR_NEWER || UNITY_INFERENCE_ENGINE
@@ -239,6 +247,16 @@ namespace VRDraw2Voxel.Inference
                 }
             }
 
+            // 4. Reject disconnected floating voxel islands (connected component analysis)
+            if (filterDisconnectedIslands && minClusterSize > 1)
+            {
+                int prunedVoxels = FilterDisconnectedIslands(occupancyGrid, voxelColors, minClusterSize);
+                if (prunedVoxels > 0)
+                {
+                    Debug.Log($"[SentisMultiTaskEngine] Pruned {prunedVoxels} disconnected floating island voxels (< {minClusterSize} cluster size).");
+                }
+            }
+
             float latency = (Time.realtimeSinceStartup - startTime) * 1000f;
             MultiTaskInferenceResult result = new MultiTaskInferenceResult
             {
@@ -255,6 +273,77 @@ namespace VRDraw2Voxel.Inference
             Debug.Log($"[SentisMultiTaskEngine] Done: Cat={cat} ({bestCatProb*100:F1}%), View={detectedView} ({bestViewProb*100:F1}%), OOD={isOOD}, Latency={latency:F1}ms");
             OnInferenceComplete?.Invoke(result);
             callback?.Invoke(result);
+        }
+
+        /// <summary>
+        /// Performs 3D connected component analysis (BFS flood fill) to eliminate floating voxel dust
+        /// and disconnected artifacts smaller than minSize voxels.
+        /// </summary>
+        private int FilterDisconnectedIslands(byte[] occupancy, Color32[] colors, int minSize)
+        {
+            if (minSize <= 1) return 0;
+
+            bool[] visited = new bool[TotalVoxels];
+            int prunedCount = 0;
+            Queue<int> queue = new Queue<int>(256);
+            List<int> currentCluster = new List<int>(minSize * 2);
+
+            // 6-connectivity neighbor offsets in 3D (X*4096 + Y*64 + Z)
+            int[] dx = { 1, -1, 0, 0, 0, 0 };
+            int[] dy = { 0, 0, 1, -1, 0, 0 };
+            int[] dz = { 0, 0, 0, 0, 1, -1 };
+
+            for (int i = 0; i < TotalVoxels; i++)
+            {
+                if (occupancy[i] == 0 || visited[i]) continue;
+
+                currentCluster.Clear();
+                queue.Clear();
+
+                visited[i] = true;
+                queue.Enqueue(i);
+                currentCluster.Add(i);
+
+                while (queue.Count > 0)
+                {
+                    int currIdx = queue.Dequeue();
+                    int cx = currIdx / (VoxelDim * VoxelDim);
+                    int rem = currIdx % (VoxelDim * VoxelDim);
+                    int cy = rem / VoxelDim;
+                    int cz = rem % VoxelDim;
+
+                    for (int n = 0; n < 6; n++)
+                    {
+                        int nx = cx + dx[n];
+                        int ny = cy + dy[n];
+                        int nz = cz + dz[n];
+
+                        if (nx < 0 || nx >= VoxelDim || ny < 0 || ny >= VoxelDim || nz < 0 || nz >= VoxelDim)
+                            continue;
+
+                        int nIdx = nx * (VoxelDim * VoxelDim) + ny * VoxelDim + nz;
+                        if (occupancy[nIdx] > 0 && !visited[nIdx])
+                        {
+                            visited[nIdx] = true;
+                            queue.Enqueue(nIdx);
+                            currentCluster.Add(nIdx);
+                        }
+                    }
+                }
+
+                if (currentCluster.Count < minSize)
+                {
+                    for (int c = 0; c < currentCluster.Count; c++)
+                    {
+                        int pruneIdx = currentCluster[c];
+                        occupancy[pruneIdx] = 0;
+                        colors[pruneIdx] = default;
+                        prunedCount++;
+                    }
+                }
+            }
+
+            return prunedCount;
         }
 
         private float[] ComputeSoftmax(float[] logits)

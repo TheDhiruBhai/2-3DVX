@@ -10,6 +10,8 @@
 /[Ll]ogs/
 .venv/
 *.npz
+__pycache__/
+*.pyc
 
 /[Uu]ser[Ss]ettings/
 

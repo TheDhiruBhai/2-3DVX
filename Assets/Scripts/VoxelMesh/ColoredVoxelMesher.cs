@@ -27,10 +27,20 @@ namespace VRDraw2Voxel.VoxelMesh
 
         private void Awake()
         {
-            _meshFilter = GetComponent<MeshFilter>();
-            _meshRenderer = GetComponent<MeshRenderer>();
-            _mesh = new Mesh { name = "ProceduralColoredVoxelItem" };
+            if (_meshFilter == null) _meshFilter = GetComponent<MeshFilter>();
+            if (_meshRenderer == null) _meshRenderer = GetComponent<MeshRenderer>();
+            if (_mesh == null)
+            {
+                _mesh = new Mesh { name = "ProceduralColoredVoxelItem" };
+            }
             _meshFilter.sharedMesh = _mesh;
+
+#if UNITY_EDITOR
+            if (vertexColorMaterial == null)
+            {
+                vertexColorMaterial = UnityEditor.AssetDatabase.LoadAssetAtPath<Material>("Assets/Materials/VoxelVertexColorMat.mat");
+            }
+#endif
 
             if (vertexColorMaterial != null)
             {
@@ -38,8 +48,7 @@ namespace VRDraw2Voxel.VoxelMesh
             }
             else
             {
-                // Use shader that natively supports per-vertex colors in URP
-                Shader shader = Shader.Find("Universal Render Pipeline/Particles/Lit")
+                Shader shader = Shader.Find("Custom/VoxelVertexColor")
                              ?? Shader.Find("Universal Render Pipeline/Unlit")
                              ?? Shader.Find("Sprites/Default")
                              ?? Shader.Find("Universal Render Pipeline/Lit")
@@ -114,6 +123,30 @@ namespace VRDraw2Voxel.VoxelMesh
 
             JobHandle handle = job.Schedule();
             handle.Complete(); // Executes within frame budget
+
+            if (_meshFilter == null) _meshFilter = GetComponent<MeshFilter>();
+            if (_meshRenderer == null) _meshRenderer = GetComponent<MeshRenderer>();
+            if (_mesh == null)
+            {
+                _mesh = new Mesh { name = "ProceduralColoredVoxelItem" };
+            }
+            if (_meshFilter != null && _meshFilter.sharedMesh != _mesh)
+            {
+                _meshFilter.sharedMesh = _mesh;
+            }
+            if (_meshRenderer != null)
+            {
+                _meshRenderer.enabled = true;
+                if (_meshRenderer.sharedMaterial == null)
+                {
+                    if (vertexColorMaterial != null) _meshRenderer.sharedMaterial = vertexColorMaterial;
+                    else
+                    {
+                        Shader sh = Shader.Find("Custom/VoxelVertexColor") ?? Shader.Find("Universal Render Pipeline/Unlit");
+                        if (sh != null) _meshRenderer.sharedMaterial = new Material(sh);
+                    }
+                }
+            }
 
             _mesh.Clear();
             if (vertices.Length > 0)

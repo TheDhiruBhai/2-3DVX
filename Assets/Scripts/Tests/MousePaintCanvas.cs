@@ -338,11 +338,7 @@ namespace VRDraw2Voxel.Tests
                         _statusMessage = $"Reconstructed {_detectedCategory} ({_categoryConfidence * 100f:F0}%) | View: {_detectedView} ({_viewConfidence * 100f:F0}%) | Voxels: {count} | {result.latencyMs:F1}ms";
                     }
 
-                    if (coloredVoxelMesher != null)
-                    {
-                        coloredVoxelMesher.GenerateColoredMesh(result.occupancyGrid, result.voxelColors);
-                    }
-                    else if (voxelMesher != null)
+                    if (coloredVoxelMesher == null && voxelMesher != null)
                     {
                         voxelMesher.GenerateMeshFromOccupancy(result.occupancyGrid);
                     }

@@ -105,7 +105,7 @@ namespace VRDraw2Voxel.Inference
         [Header("OOD & Perspective Rejection")]
         [Tooltip("Minimum softmax probability required to accept drawing as valid shape.")]
         [Range(0.3f, 0.95f)]
-        [SerializeField] private float oodConfidenceThreshold = 0.60f;
+        [SerializeField] private float oodConfidenceThreshold = 0.50f;
 
         [Header("Visual-Hull Prior (GATOR)")]
         [Tooltip("Constrains decoded voxels to the extruded 2D sketch bounding envelope. Kept false by default to preserve full volumetric rounded 3D contours.")]
@@ -406,6 +406,15 @@ namespace VRDraw2Voxel.Inference
             float top3Prob = sortedIndices.Length > 2 ? catProbs[top3Idx] : 0f;
 
             float cumulativeTop3 = top1Prob + top2Prob + top3Prob;
+
+            // Rescue creative or noisy user drawings where OOD_Reject was ranked #1 but a valid recognized category has strong affinity (>= 35%)
+            if (top1Idx == (int)ReconstructedCategory.OOD_Reject && top2Idx != (int)ReconstructedCategory.OOD_Reject && top2Prob >= 0.35f)
+            {
+                top1Idx = top2Idx;
+                top1Prob = top2Prob;
+                top2Idx = (sortedIndices.Length > 2) ? sortedIndices[2] : (int)ReconstructedCategory.OOD_Reject;
+                top2Prob = (sortedIndices.Length > 2) ? catProbs[top2Idx] : 0f;
+            }
 
             // 2. Differentiate Creative Ambiguous Shapes vs. Pure Noise / Flat Entropy
             bool isPureNoise = (top1Prob < flatDistributionEntropyThreshold) ||

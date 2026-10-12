@@ -637,29 +637,31 @@ namespace VRDraw2Voxel.Tests
             {
                 _lastGeneratedItemName = "Tactical Magnum Handgun";
                 _lastCategoryName = "WEAPONS";
-                FillRect(32 * scale, 10 * scale, 40 * scale, 26 * scale); // Grip
-                FillRect(18 * scale, 26 * scale, 44 * scale, 36 * scale); // Slide
-                FillRect(12 * scale, 28 * scale, 18 * scale, 34 * scale); // Barrel
-                FillRect(26 * scale, 20 * scale, 32 * scale, 26 * scale); // Trigger guard
+                FillRect(34 * scale, 8 * scale, 42 * scale, 26 * scale);  // Grip
+                FillRect(6 * scale, 26 * scale, 44 * scale, 36 * scale);   // Slide
+                FillRect(4 * scale, 28 * scale, 8 * scale, 34 * scale);    // Muzzle tip
+                FillRect(24 * scale, 20 * scale, 30 * scale, 26 * scale);  // Trigger guard notch
+                FillRect(26 * scale, 16 * scale, 34 * scale, 24 * scale);  // Magazine/Receiver
             }
             else if (type == "Blaster")
             {
                 _lastGeneratedItemName = "Hyperion Sci-Fi Blaster";
                 _lastCategoryName = "WEAPONS";
-                FillRect(34 * scale, 12 * scale, 42 * scale, 26 * scale); // Grip
-                FillRect(20 * scale, 24 * scale, 44 * scale, 36 * scale); // Body
-                FillRect(8 * scale, 27 * scale, 20 * scale, 33 * scale);  // Barrel
-                FillCircle(14 * scale, 30 * scale, 5 * scale);            // Ring 1
-                FillCircle(18 * scale, 30 * scale, 5 * scale);            // Ring 2
-                FillRect(22 * scale, 16 * scale, 32 * scale, 24 * scale); // Power cell
+                FillRect(36 * scale, 8 * scale, 44 * scale, 26 * scale);  // Grip
+                FillRect(20 * scale, 26 * scale, 44 * scale, 36 * scale); // Body
+                FillRect(4 * scale, 28 * scale, 20 * scale, 34 * scale);  // Barrel
+                FillCircle(10 * scale, 31 * scale, 4 * scale);            // Ring 1
+                FillCircle(16 * scale, 31 * scale, 4 * scale);            // Ring 2
+                FillRect(24 * scale, 16 * scale, 32 * scale, 24 * scale); // Power cell
             }
             else if (type == "Axe")
             {
                 _lastGeneratedItemName = "Viking Battleaxe";
                 _lastCategoryName = "WEAPONS";
-                FillRect(31 * scale, 6 * scale, 32 * scale, 54 * scale);  // Shaft
-                FillRect(33 * scale, 36 * scale, 46 * scale, 50 * scale); // Head
-                FillRect(44 * scale, 32 * scale, 48 * scale, 54 * scale); // Flare
+                FillRect(29 * scale, 4 * scale, 33 * scale, 58 * scale);  // Sturdy wooden shaft (width 5)
+                FillRect(31 * scale, 38 * scale, 50 * scale, 52 * scale); // Main axe head
+                FillRect(48 * scale, 32 * scale, 53 * scale, 58 * scale); // Flared curved cutting blade
+                FillRect(24 * scale, 43 * scale, 31 * scale, 47 * scale); // Rear counter-spike
             }
 
             // --- CATEGORY 2: TOYS ---

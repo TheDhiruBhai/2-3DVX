@@ -336,11 +336,23 @@ namespace VRDraw2Voxel.Tests
 
                     if (_isOutOfDistribution)
                     {
-                        _statusMessage = $"<color=#ff6666>[OOD REJECTED ({_categoryConfidence * 100f:F0}%)]</color> Stroke does not match known weapon/object!";
+                        _statusMessage = $"<color=#ff6666>[OOD REJECTED ({_categoryConfidence * 100f:F0}%)]</color> Input is unstructured noise/scribble!";
+                    }
+                    else if (result.isHybridSketch)
+                    {
+                        _lastCategoryName = $"{_detectedCategory.ToString().ToUpper()} (HYBRID)";
+                        _lastGeneratedItemName = $"Hybrid {_detectedCategory}-{result.secondaryCategory}";
+                        _statusMessage = $"<color=#66ddff>[HYBRID {result.family.ToString().ToUpper()}]</color> {_detectedCategory} ({result.categoryConfidence * 100f:F0}%) + {result.secondaryCategory} ({result.secondaryConfidence * 100f:F0}%) | View: {_detectedView} | Voxels: {count} | {result.latencyMs:F1}ms";
+
+                        if (coloredVoxelMesher != null)
+                        {
+                            coloredVoxelMesher.GenerateFromInferenceResult(result);
+                        }
                     }
                     else
                     {
                         _lastCategoryName = _detectedCategory.ToString().ToUpper();
+                        _lastGeneratedItemName = GetCanonicalItemName(_detectedCategory);
                         _statusMessage = $"Reconstructed {_detectedCategory} ({_categoryConfidence * 100f:F0}%) | View: {_detectedView} ({_viewConfidence * 100f:F0}%) | Voxels: {count} | {result.latencyMs:F1}ms";
 
                         // Swap holographic preview to final colored voxel mesh
@@ -880,5 +892,25 @@ namespace VRDraw2Voxel.Tests
                 _showDisclaimerModal = false;
             }
         }
+
+        private string GetCanonicalItemName(ReconstructedCategory cat)
+        {
+            switch (cat)
+            {
+                case ReconstructedCategory.Sword: return "Legendary Buster Sword";
+                case ReconstructedCategory.Shield: return "Paladin's Kite Shield";
+                case ReconstructedCategory.Blaster: return "Sci-Fi Heavy Blaster";
+                case ReconstructedCategory.Axe: return "Viking War Axe";
+                case ReconstructedCategory.TeddyBear: return "Plush Teddy Bear Trophy";
+                case ReconstructedCategory.RubberDuck: return "Classic Rubber Ducky";
+                case ReconstructedCategory.ToyRobot: return "Retro Wind-Up Robot";
+                case ReconstructedCategory.ToyBunny: return "Fluffy Bunny Figurine";
+                case ReconstructedCategory.Gamepad: return "DualGrip Pro Game Controller";
+                case ReconstructedCategory.RetroTV: return "Vintage Cathode CRT TV";
+                case ReconstructedCategory.GameBoy: return "Pocket 8-Bit Console";
+                default: return "Procedural Voxel Asset";
+            }
+        }
     }
 }
+

@@ -29,6 +29,14 @@ namespace VRDraw2Voxel.Inference
         Unknown = -1
     }
 
+    public enum SemanticFamily
+    {
+        Weapons = 0,
+        Toys = 1,
+        Electronics = 2,
+        Unknown = -1
+    }
+
     public enum PerspectiveView
     {
         Front_XY = 0,
@@ -47,19 +55,52 @@ namespace VRDraw2Voxel.Inference
         public byte[] occupancyGrid; // 64x64x64 binary (0 or 1)
         public Color32[] voxelColors; // 64x64x64 RGB colors
         public float latencyMs;
+
+        // Hybrid / Majority Ambiguity Fields
+        public ReconstructedCategory secondaryCategory;
+        public float secondaryConfidence;
+        public bool isHybridSketch;
+        public float hybridBlendAlpha;
+        public SemanticFamily family;
+        public float cumulativeTop3Confidence;
     }
 
     /// <summary>
     /// Executes the multi-task AntiGravity Draw2Voxel ONNX model in Unity Sentis / Inference Engine.
     /// Disambiguates perspective (Front/Side/Top), classifies object category with OOD rejection,
-    /// feeds a 2-channel (Stroke + Distance Field) input tensor, applies GATOR Visual-Hull prior masking,
-    /// and extracts a 64x64x64 colored 3D voxel grid within VR frame budgets (<15 ms).
+    /// performs majority canonical labeling and soft latent blending for hybrid sketches,
+    /// feeds a 2-channel (Stroke + Distance Field) input tensor, and renders full volumetric 3D assets.
     /// </summary>
     public class SentisMultiTaskEngine : MonoBehaviour
     {
         [Header("Model Configuration")]
         [SerializeField] private ModelAsset multiTaskModelAsset;
+        [SerializeField] private ModelAsset decoderModelAsset;
+        [SerializeField] private TextAsset centroidsJsonAsset;
         [SerializeField] private BackendType backend = BackendType.GPUCompute;
+
+        [Header("Majority Decision & Hybrid Sketch Blending")]
+        [Tooltip("If top class confidence is above this threshold, treat as a clear majority decision.")]
+        [Range(0.40f, 0.90f)]
+        [SerializeField] private float clearMajorityThreshold = 0.55f;
+
+        [Tooltip("Maximum difference between top-1 and top-2 class probabilities to consider them ambiguous/hybrid.")]
+        [Range(0.05f, 0.40f)]
+        [SerializeField] private float hybridAmbiguityMargin = 0.20f;
+
+        [Tooltip("Cumulative top-3 probability required to accept creative ambiguous drawings (overrides OOD rejection).")]
+        [Range(0.50f, 0.95f)]
+        [SerializeField] private float cumulativeTop3AcceptThreshold = 0.70f;
+
+        [Tooltip("Maximum probability below which the distribution is considered completely flat / pure noise.")]
+        [Range(0.10f, 0.40f)]
+        [SerializeField] private float flatDistributionEntropyThreshold = 0.25f;
+
+        [Tooltip("Enable latent blending between top-2 class centroids when hybrid/ambiguous drawing is detected within the same family.")]
+        [SerializeField] private bool enableLatentBlending = true;
+
+        [Tooltip("Decode canonical centroid embedding for the majority class to guarantee smooth, volumetric geometry.")]
+        [SerializeField] private bool useCanonicalEmbeddingDecoding = true;
 
         [Header("OOD & Perspective Rejection")]
         [Tooltip("Minimum softmax probability required to accept drawing as valid shape.")]
@@ -67,8 +108,8 @@ namespace VRDraw2Voxel.Inference
         [SerializeField] private float oodConfidenceThreshold = 0.60f;
 
         [Header("Visual-Hull Prior (GATOR)")]
-        [Tooltip("Constrains decoded voxels to the extruded 2D sketch bounding envelope to eliminate empty space hallucinations.")]
-        [SerializeField] private bool applyVisualHullPrior = true;
+        [Tooltip("Constrains decoded voxels to the extruded 2D sketch bounding envelope. Kept false by default to preserve full volumetric rounded 3D contours.")]
+        [SerializeField] private bool applyVisualHullPrior = false;
 
         [Tooltip("Margin dilation applied to the 2D bounding envelope before extrusion.")]
         [Range(0, 5)]
@@ -87,11 +128,16 @@ namespace VRDraw2Voxel.Inference
         [SerializeField] private int minClusterSize = 8;
 
         private Model _runtimeModel;
+        private Model _runtimeDecoderModel;
 #if UNITY_6000_0_OR_NEWER || UNITY_INFERENCE_ENGINE
         private Worker _worker;
+        private Worker _decoderWorker;
 #else
         private IWorker _worker;
+        private IWorker _decoderWorker;
 #endif
+
+        private Dictionary<int, float[]> _classCentroids;
 
         public const int InputRes = 64;
         public const int VoxelDim = 64;
@@ -99,9 +145,41 @@ namespace VRDraw2Voxel.Inference
 
         public event Action<MultiTaskInferenceResult> OnInferenceComplete;
 
+        public static SemanticFamily GetSemanticFamily(ReconstructedCategory cat)
+        {
+            switch (cat)
+            {
+                case ReconstructedCategory.Sword:
+                case ReconstructedCategory.Shield:
+                case ReconstructedCategory.Blaster:
+                case ReconstructedCategory.Axe:
+                    return SemanticFamily.Weapons;
+
+                case ReconstructedCategory.TeddyBear:
+                case ReconstructedCategory.RubberDuck:
+                case ReconstructedCategory.ToyRobot:
+                case ReconstructedCategory.ToyBunny:
+                    return SemanticFamily.Toys;
+
+                case ReconstructedCategory.Gamepad:
+                case ReconstructedCategory.RetroTV:
+                case ReconstructedCategory.GameBoy:
+                    return SemanticFamily.Electronics;
+
+                default:
+                    return SemanticFamily.Unknown;
+            }
+        }
+
         private void Awake()
         {
             InitializeEngine();
+        }
+
+        private void OnDestroy()
+        {
+            _worker?.Dispose();
+            _decoderWorker?.Dispose();
         }
 
         public void InitializeEngine()
@@ -110,6 +188,14 @@ namespace VRDraw2Voxel.Inference
             if (multiTaskModelAsset == null)
             {
                 multiTaskModelAsset = UnityEditor.AssetDatabase.LoadAssetAtPath<ModelAsset>("Assets/ML/Models/draw2voxel_multitask.onnx");
+            }
+            if (decoderModelAsset == null)
+            {
+                decoderModelAsset = UnityEditor.AssetDatabase.LoadAssetAtPath<ModelAsset>("Assets/ML/Models/draw2voxel_decoder.onnx");
+            }
+            if (centroidsJsonAsset == null)
+            {
+                centroidsJsonAsset = UnityEditor.AssetDatabase.LoadAssetAtPath<TextAsset>("Assets/ML/Models/draw2voxel_multitask_centroids.json");
             }
 #endif
 
@@ -130,6 +216,71 @@ namespace VRDraw2Voxel.Inference
                 Debug.LogWarning($"[SentisMultiTaskEngine] Backend {backend} failed ({ex.Message}), falling back to CPU.");
                 backend = BackendType.CPU;
                 _worker = new Worker(_runtimeModel, backend);
+            }
+
+            if (decoderModelAsset != null)
+            {
+                try
+                {
+                    _runtimeDecoderModel = ModelLoader.Load(decoderModelAsset);
+                    _decoderWorker = new Worker(_runtimeDecoderModel, backend);
+                    Debug.Log($"[SentisMultiTaskEngine] Initialized standalone decoder worker on backend: {backend}");
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[SentisMultiTaskEngine] Decoder backend {backend} failed ({ex.Message}), falling back to CPU.");
+                    _decoderWorker = new Worker(_runtimeDecoderModel, BackendType.CPU);
+                }
+            }
+
+            LoadCentroids();
+        }
+
+        private void LoadCentroids()
+        {
+            _classCentroids = new Dictionary<int, float[]>();
+            if (centroidsJsonAsset == null) return;
+
+            string json = centroidsJsonAsset.text;
+            if (string.IsNullOrEmpty(json)) return;
+
+            try
+            {
+                for (int c = 0; c < 12; c++)
+                {
+                    string marker = $"\"{c}\":";
+                    int idx = json.IndexOf(marker, StringComparison.Ordinal);
+                    if (idx < 0) continue;
+
+                    int cMarker = json.IndexOf("\"centroid\":", idx, StringComparison.Ordinal);
+                    if (cMarker < 0) continue;
+
+                    int startBracket = json.IndexOf('[', cMarker);
+                    int endBracket = json.IndexOf(']', startBracket);
+                    if (startBracket < 0 || endBracket < 0) continue;
+
+                    string arrayStr = json.Substring(startBracket + 1, endBracket - startBracket - 1);
+                    string[] tokens = arrayStr.Split(new char[] { ',', ' ', '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+
+                    float[] vec = new float[tokens.Length];
+                    for (int k = 0; k < tokens.Length; k++)
+                    {
+                        if (float.TryParse(tokens[k], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float val))
+                        {
+                            vec[k] = val;
+                        }
+                    }
+
+                    if (vec.Length == 512)
+                    {
+                        _classCentroids[c] = vec;
+                    }
+                }
+                Debug.Log($"[SentisMultiTaskEngine] Successfully parsed {_classCentroids.Count} class centroids in R^512.");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[SentisMultiTaskEngine] Error parsing centroids JSON: {ex.Message}");
             }
         }
 
@@ -183,6 +334,7 @@ namespace VRDraw2Voxel.Inference
             Tensor<float> legacyVoxTensor = _worker.PeekOutput("output_voxels_4ch") as Tensor<float>;
             Tensor<float> catLogitsTensor = _worker.PeekOutput("category_logits") as Tensor<float>;
             Tensor<float> viewLogitsTensor = _worker.PeekOutput("view_logits") as Tensor<float>;
+            Tensor<float> latentTensor = _worker.PeekOutput("latent_z") as Tensor<float>;
 
             if ((occTensor == null && legacyVoxTensor == null) || catLogitsTensor == null || viewLogitsTensor == null)
             {
@@ -194,6 +346,13 @@ namespace VRDraw2Voxel.Inference
             using Tensor<float> viewCpu = viewLogitsTensor.ReadbackAndClone();
             float[] catLogits = catCpu.DownloadToArray();
             float[] viewLogits = viewCpu.DownloadToArray();
+
+            float[] latentZ = null;
+            if (latentTensor != null)
+            {
+                using Tensor<float> latentCpu = latentTensor.ReadbackAndClone();
+                latentZ = latentCpu.DownloadToArray();
+            }
 
             float[] rawOcc = null;
             float[] rawRgb = null;
@@ -221,31 +380,126 @@ namespace VRDraw2Voxel.Inference
             TensorFloat legacyVoxTensor = _worker.PeekOutput("output_voxels_4ch") as TensorFloat;
             TensorFloat catLogitsTensor = _worker.PeekOutput("category_logits") as TensorFloat;
             TensorFloat viewLogitsTensor = _worker.PeekOutput("view_logits") as TensorFloat;
+            TensorFloat latentTensor = _worker.PeekOutput("latent_z") as TensorFloat;
 
             float[] catLogits = catLogitsTensor.ToReadOnlyArray();
             float[] viewLogits = viewLogitsTensor.ToReadOnlyArray();
+            float[] latentZ = latentTensor != null ? latentTensor.ToReadOnlyArray() : null;
             float[] rawOcc = occTensor != null ? occTensor.ToReadOnlyArray() : null;
             float[] rawRgb = rgbTensor != null ? rgbTensor.ToReadOnlyArray() : null;
             float[] rawLegacyVox4Ch = legacyVoxTensor != null ? legacyVoxTensor.ToReadOnlyArray() : null;
 #endif
 
-            // 1. Evaluate Category Softmax & OOD Rejection (12 classes: 0..10 canonical, 11 OOD_Reject)
-            float[] catSoftmax = ComputeSoftmax(catLogits);
-            int bestCatIdx = 0;
-            float bestCatProb = catSoftmax[0];
-            for (int i = 1; i < catSoftmax.Length; i++)
+            // 1. Evaluate Softmax Probabilities & Sort Class Predictions
+            float[] catProbs = ComputeSoftmax(catLogits);
+            int[] sortedIndices = new int[catProbs.Length];
+            for (int i = 0; i < sortedIndices.Length; i++) sortedIndices[i] = i;
+            Array.Sort(sortedIndices, (a, b) => catProbs[b].CompareTo(catProbs[a]));
+
+            int top1Idx = sortedIndices[0];
+            float top1Prob = catProbs[top1Idx];
+
+            int top2Idx = sortedIndices.Length > 1 ? sortedIndices[1] : top1Idx;
+            float top2Prob = sortedIndices.Length > 1 ? catProbs[top2Idx] : 0f;
+
+            int top3Idx = sortedIndices.Length > 2 ? sortedIndices[2] : top2Idx;
+            float top3Prob = sortedIndices.Length > 2 ? catProbs[top3Idx] : 0f;
+
+            float cumulativeTop3 = top1Prob + top2Prob + top3Prob;
+
+            // 2. Differentiate Creative Ambiguous Shapes vs. Pure Noise / Flat Entropy
+            bool isPureNoise = (top1Prob < flatDistributionEntropyThreshold) ||
+                               (top1Idx == (int)ReconstructedCategory.OOD_Reject && top1Prob > 0.50f);
+            bool isCreativeAmbiguous = !isPureNoise && (cumulativeTop3 >= cumulativeTop3AcceptThreshold);
+
+            bool isOOD = false;
+            if (isPureNoise)
             {
-                if (catSoftmax[i] > bestCatProb)
+                isOOD = true;
+            }
+            else if (!isCreativeAmbiguous && top1Prob < oodConfidenceThreshold)
+            {
+                isOOD = true;
+            }
+
+            ReconstructedCategory majorityCat = isOOD ? ReconstructedCategory.OOD_Reject : (ReconstructedCategory)top1Idx;
+
+            // 3. Majority Decision Rule & Latent Blending
+            bool isHybrid = false;
+            float blendAlpha = 1.0f;
+            ReconstructedCategory secondaryCat = (ReconstructedCategory)top2Idx;
+            SemanticFamily family = GetSemanticFamily(majorityCat);
+
+            float[] finalZ = latentZ;
+
+            if (!isOOD && enableLatentBlending && _classCentroids != null)
+            {
+                SemanticFamily fam1 = GetSemanticFamily((ReconstructedCategory)top1Idx);
+                SemanticFamily fam2 = GetSemanticFamily((ReconstructedCategory)top2Idx);
+
+                bool top2Close = Mathf.Abs(top1Prob - top2Prob) <= hybridAmbiguityMargin;
+                bool sameFamily = (fam1 == fam2) && (fam1 != SemanticFamily.Unknown);
+
+                if (top2Close && sameFamily && _classCentroids.ContainsKey(top1Idx) && _classCentroids.ContainsKey(top2Idx))
                 {
-                    bestCatProb = catSoftmax[i];
-                    bestCatIdx = i;
+                    // Compute blended latent code:
+                    // z_blend = alpha * z_C1 + (1 - alpha) * z_C2 where alpha = P1 / (P1 + P2)
+                    blendAlpha = top1Prob / (top1Prob + top2Prob + 1e-6f);
+                    float[] z1 = _classCentroids[top1Idx];
+                    float[] z2 = _classCentroids[top2Idx];
+
+                    finalZ = new float[512];
+                    for (int d = 0; d < 512; d++)
+                    {
+                        finalZ[d] = blendAlpha * z1[d] + (1.0f - blendAlpha) * z2[d];
+                    }
+
+                    isHybrid = true;
+                    Debug.Log($"[SentisMultiTaskEngine] Hybrid sketch detected in family {fam1}! Blending {((ReconstructedCategory)top1Idx)} ({blendAlpha*100:F0}%) and {((ReconstructedCategory)top2Idx)} ({(1-blendAlpha)*100:F0}%).");
+                }
+                else if (useCanonicalEmbeddingDecoding && _classCentroids.ContainsKey(top1Idx))
+                {
+                    // Snap to canonical majority centroid embedding
+                    finalZ = _classCentroids[top1Idx];
                 }
             }
 
-            bool isOOD = (bestCatIdx == (int)ReconstructedCategory.OOD_Reject) || (bestCatProb < oodConfidenceThreshold);
-            ReconstructedCategory cat = isOOD ? ReconstructedCategory.OOD_Reject : (ReconstructedCategory)bestCatIdx;
+            // 4. Standalone 3D Decoder Execution on Blended or Canonical Latent
+            if (!isOOD && _decoderWorker != null && finalZ != null && (isHybrid || useCanonicalEmbeddingDecoding))
+            {
+                TensorShape zShape = new TensorShape(1, 512);
+#if UNITY_6000_0_OR_NEWER || UNITY_INFERENCE_ENGINE
+                using Tensor<float> zTensor = new Tensor<float>(zShape, finalZ);
+                _decoderWorker.Schedule(zTensor);
+                yield return null;
 
-            // 2. Evaluate View Disambiguation Softmax
+                Tensor<float> decOccTensor = _decoderWorker.PeekOutput("voxel_occupancy") as Tensor<float>;
+                Tensor<float> decRgbTensor = _decoderWorker.PeekOutput("voxel_rgb") as Tensor<float>;
+
+                if (decOccTensor != null && decRgbTensor != null)
+                {
+                    using Tensor<float> dOccCpu = decOccTensor.ReadbackAndClone();
+                    using Tensor<float> dRgbCpu = decRgbTensor.ReadbackAndClone();
+                    rawOcc = dOccCpu.DownloadToArray();
+                    rawRgb = dRgbCpu.DownloadToArray();
+                }
+#else
+                using TensorFloat zTensor = new TensorFloat(zShape, finalZ);
+                _decoderWorker.Schedule(zTensor);
+                yield return null;
+
+                TensorFloat decOccTensor = _decoderWorker.PeekOutput("voxel_occupancy") as TensorFloat;
+                TensorFloat decRgbTensor = _decoderWorker.PeekOutput("voxel_rgb") as TensorFloat;
+
+                if (decOccTensor != null && decRgbTensor != null)
+                {
+                    rawOcc = decOccTensor.ToReadOnlyArray();
+                    rawRgb = decRgbTensor.ToReadOnlyArray();
+                }
+#endif
+            }
+
+            // 5. Evaluate View Disambiguation Softmax
             float[] viewSoftmax = ComputeSoftmax(viewLogits);
             int bestViewIdx = 0;
             float bestViewProb = viewSoftmax[0];
@@ -258,6 +512,7 @@ namespace VRDraw2Voxel.Inference
                 }
             }
             PerspectiveView detectedView = (PerspectiveView)bestViewIdx;
+
 
             // 3. Process 64^3 Occupancy & Color Palettes
             byte[] occupancyGrid = new byte[TotalVoxels];
@@ -338,17 +593,23 @@ namespace VRDraw2Voxel.Inference
             float latency = (Time.realtimeSinceStartup - startTime) * 1000f;
             MultiTaskInferenceResult result = new MultiTaskInferenceResult
             {
-                category = cat,
-                categoryConfidence = bestCatProb,
+                category = majorityCat,
+                categoryConfidence = top1Prob,
                 detectedView = detectedView,
                 viewConfidence = bestViewProb,
                 isOutOfDistribution = isOOD,
                 occupancyGrid = occupancyGrid,
                 voxelColors = voxelColors,
-                latencyMs = latency
+                latencyMs = latency,
+                secondaryCategory = secondaryCat,
+                secondaryConfidence = top2Prob,
+                isHybridSketch = isHybrid,
+                hybridBlendAlpha = blendAlpha,
+                family = family,
+                cumulativeTop3Confidence = cumulativeTop3
             };
 
-            Debug.Log($"[SentisMultiTaskEngine] Done: Cat={cat} ({bestCatProb*100:F1}%), View={detectedView} ({bestViewProb*100:F1}%), OOD={isOOD}, Latency={latency:F1}ms");
+            Debug.Log($"[SentisMultiTaskEngine] Done: Cat={majorityCat} ({top1Prob*100:F1}%), Hybrid={isHybrid} (Alpha={blendAlpha*100:F0}%), View={detectedView} ({bestViewProb*100:F1}%), OOD={isOOD}, Latency={latency:F1}ms");
             OnInferenceComplete?.Invoke(result);
             callback?.Invoke(result);
         }
@@ -653,11 +914,6 @@ namespace VRDraw2Voxel.Inference
                 exp[i] /= sumExp;
             }
             return exp;
-        }
-
-        private void OnDestroy()
-        {
-            _worker?.Dispose();
         }
     }
 }

@@ -15,8 +15,14 @@ An experimental Mixed Reality (MR) tactical sandbox built in **Unity 6**, combin
 The centerpiece of **2-3DVX** is the **Draw2Voxel** neural reconstruction pipeline. Players sketch loose, imperfect 2D silhouettes in spatial MR space or on screen, and the model inferentially resolves perspective, categorizes the intended asset, and synthesizes solid 3D voxel geometry with baked vertex colors.
 
 ```
-       [Player 2D Sketch]
-   (Rough strokes from any angle)
+       [Player 2D Sketch / Hollow Contour]
+   (Rough strokes from any angle in spatial MR)
+                 │
+                 ▼
+     ┌───────────────────────┐
+     │ 2-Channel Preprocessor│ ──► [1, 2, 64, 64]
+     │ (Stroke AABB + 2D SDF)│     (Normalized Strokes + Truncated Distance Field)
+     └───────────┬───────────┘
                  │
                  ▼
      ┌───────────────────────┐
@@ -28,15 +34,20 @@ The centerpiece of **2-3DVX** is the **Draw2Voxel** neural reconstruction pipeli
 ┌──────────────┐                           ┌──────────────┐
 │  Category    │                           │  Perspective │
 │  Classifier  │                           │  Disambiguator│
-│(11 Archetypes)                           │ (Front/Side/Top)
+│(11 Cat + OOD)│                           │ (Front/Side/Top)
 └──────┬───────┘                           └──────┬───────┘
-       │ [Softmax τ ≥ 0.60]                        │
+       │ [Softmax τ ≥ 0.55 / Majority Snap]        │
        │                                           ▼
-       │                               [Auto-Orientation Alignment]
-       │
-       ▼
+       ▼                               [Auto-Orientation Alignment]
 ┌─────────────────────────────┐
-│ 3D Deconvolutional Decoder  │ ──► 4 × 64³ Tensor (Occupancy + RGB)
+│ Ambiguous / Hybrid Blending │ ──► z_blend = α · z_c1 + (1 - α) · z_c2
+│ & Centroid Alignment Engine │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│ 3D Deconvolutional Decoder  │ ──► Voxel Occupancy [1, 1, 64³] + RGB [1, 3, 64³]
+│ (draw2voxel_decoder.onnx)   │
 └──────────────┬──────────────┘
                │
                ▼
@@ -52,14 +63,15 @@ The centerpiece of **2-3DVX** is the **Draw2Voxel** neural reconstruction pipeli
 
 ### 1. High-Level Pipeline Architecture
 
-The **Draw2Voxel** network (`AntiGravityMultiTaskNet`) is a lightweight multi-task neural network designed for **instant, zero-token, on-device execution**. It simultaneously accomplishes three distinct objectives from a single 2D drawing:
-1. **Volumetric 3D Synthesis:** Reconstructs the 3D geometry and RGB palette into a $4 \times 64 \times 64 \times 64$ tensor.
-2. **Category Classification:** Identifies which item archetype was drawn across 11 classes, enabling Out-of-Distribution (OOD) rejection when random doodles or scribbles are submitted.
+The **Draw2Voxel** network (`AntiGravityMultiTaskNet`) is a lightweight multi-task neural network designed for **instant, zero-token, on-device execution**. It simultaneously accomplishes three distinct objectives from a 2-channel normalized sketch input:
+1. **Volumetric 3D Synthesis:** Reconstructs the 3D geometry and RGB palette into separated occupancy `[1, 1, 64, 64, 64]` and RGB `[1, 3, 64, 64, 64]` tensors.
+2. **Category Classification & OOD Filtering:** Identifies which item archetype was drawn across 11 canonical classes plus a dedicated 12th synthetic `OOD_Reject` class, preventing arbitrary scribble artifacts.
 3. **Perspective Disambiguation:** Classifies whether the player drew the object from the **Front ($XY$)**, **Side ($ZY$)**, or **Top ($XZ$)** view, enabling Unity to automatically re-orient the spawned 3D mesh to face the player.
+4. **Hybrid Latent Blending:** When an ambiguous drawing bridges multiple sub-classes (e.g. Bear vs Bunny or Sword vs Axe), interpolates between canonical class centroids $z_{\text{blend}} = \alpha \cdot z_{C_1} + (1 - \alpha) \cdot z_{C_2}$ and feeds $z_{\text{blend}}$ into a standalone 3D decoder (`draw2voxel_decoder.onnx`).
 
 ```mermaid
 flowchart TD
-    In["2D Input Sketch<br/>(1 × 64 × 64)"] --> E1["Conv2D (1→32, k=3, s=2)<br/>BN + LeakyReLU(0.2)<br/>(32 × 32 × 32)"]
+    In["2-Channel Input Sketch<br/>(2 × 64 × 64)<br/>Ch 0: Stroke, Ch 1: SDF"] --> E1["Conv2D (2→32, k=3, s=2)<br/>BN + LeakyReLU(0.2)<br/>(32 × 32 × 32)"]
     E1 --> E2["Conv2D (32→64, k=3, s=2)<br/>BN + LeakyReLU(0.2)<br/>(64 × 16 × 16)"]
     E2 --> E3["Conv2D (64→128, k=3, s=2)<br/>BN + LeakyReLU(0.2)<br/>(128 × 8 × 8)"]
     E3 --> E4["Conv2D (128→256, k=3, s=2)<br/>BN + LeakyReLU(0.2)<br/>(256 × 4 × 4)"]
@@ -67,17 +79,19 @@ flowchart TD
     E5 --> Flat["Flatten (2048)<br/>Linear(2048 → 512)"]
     Flat --> Z["Latent Bottleneck<br/>z ∈ ℝ⁵¹²"]
 
-    Z --> HeadA["Head A: Category Softmax<br/>Linear(512→128) → Linear(128→11)"]
+    Z --> HeadA["Head A: Category Softmax<br/>Linear(512→128) → Linear(128→12)"]
     Z --> HeadB["Head B: View Disambiguation<br/>Linear(512→128) → Linear(128→3)"]
-    Z --> HeadC["Head C: 3D Decoder Seed<br/>Linear(512 → 128 × 4 × 4 × 4)"]
+    Z --> Blend["Latent Blending & Centroid Snap<br/>z_blend = α · z_c1 + (1-α) · z_c2"]
 
-    HeadC --> D1["ConvTranspose3D (128→64, k=4, s=2)<br/>BN + LeakyReLU(0.2)<br/>(64 × 8 × 8 × 8)"]
+    Blend --> DecSeed["Linear(512 → 128 × 4 × 4 × 4)"]
+    DecSeed --> D1["ConvTranspose3D (128→64, k=4, s=2)<br/>BN + LeakyReLU(0.2)<br/>(64 × 8 × 8 × 8)"]
     D1 --> D2["ConvTranspose3D (64→32, k=4, s=2)<br/>BN + LeakyReLU(0.2)<br/>(32 × 16 × 16 × 16)"]
     D2 --> D3["ConvTranspose3D (32→16, k=4, s=2)<br/>BN + LeakyReLU(0.2)<br/>(16 × 32 × 32 × 32)"]
-    D3 --> D4["ConvTranspose3D (16→4, k=4, s=2)<br/>Sigmoid Activation<br/>(4 × 64 × 64 × 64)"]
+    
+    D3 --> HeadOcc["Head Occ: ConvTranspose3D (16→1)<br/>Sigmoid → (1 × 64 × 64 × 64)"]
+    D3 --> HeadRGB["Head RGB: ConvTranspose3D (16→3)<br/>Sigmoid → (3 × 64 × 64 × 64)"]
 
-    D4 --> VoxelOut["Ch 0: Occupancy (0 or 1)<br/>Ch 1-3: RGB Normalized Colors"]
-    HeadA --> OOD["OOD Gate: max(Softmax) ≥ 0.60"]
+    HeadA --> OOD["Majority Snap & OOD Gate<br/>Top 3 Sum ≥ 0.70 / Max < 0.25"]
     HeadB --> Rot["Orientation Alignment<br/>Front / Side / Top Euler Offset"]
 ```
 
@@ -87,20 +101,21 @@ flowchart TD
 
 | Component | Layer / Operation | Output Dimension | What It Does | Why This Operation Was Chosen |
 | :--- | :--- | :--- | :--- | :--- |
-| **Input** | Grayscale Canvas | `[B, 1, 64, 64]` | Normalized stroke silhouette in range $[0.0, 1.0]$. | High enough to preserve distinct silhouette features; small enough to ensure sub-15ms compute latency. |
-| **Encoder L1** | `Conv2d(1→32, k=3, s=2, p=1)`<br>`BatchNorm2d` + `LeakyReLU(0.2)` | `[B, 32, 32, 32]` | Halves spatial resolution; extracts low-level edge and line stroke primitives. | Kernel 3 with stride 2 avoids information loss from max-pooling; LeakyReLU ($\alpha=0.2$) prevents dying neurons on sparse drawings; BatchNorm stabilizes gradients across varying stroke densities. |
+| **Input** | 2-Channel Tensor | `[B, 2, 64, 64]` | **Ch 0:** Tight AABB-centered stroke mask ($52\times 52$).<br>**Ch 1:** Truncated Euclidean Distance Field ($0.0$ at strokes, $1.0$ at empty air). | Solves stroke sparsity and receptive field dropouts; continuous distance gradients allow CNN to trace boundaries reliably. |
+| **Encoder L1** | `Conv2d(2→32, k=3, s=2, p=1)`<br>`BatchNorm2d` + `LeakyReLU(0.2)` | `[B, 32, 32, 32]` | Halves spatial resolution; extracts low-level edge and distance gradient primitives. | Kernel 3 with stride 2 avoids information loss from max-pooling; LeakyReLU ($\alpha=0.2$) prevents dying neurons on sparse drawings; BatchNorm stabilizes gradients across varying stroke densities. |
 | **Encoder L2** | `Conv2d(32→64, k=3, s=2, p=1)`<br>`BatchNorm2d` + `LeakyReLU(0.2)` | `[B, 64, 16, 16]` | Captures stroke curvature, line junctions, and corner intersections. | Doubling channel depth allows learning complementary stroke patterns (straight lines, arcs, corners) without spatial bloat. |
 | **Encoder L3** | `Conv2d(64→128, k=3, s=2, p=1)`<br>`BatchNorm2d` + `LeakyReLU(0.2)` | `[B, 128, 8, 8]` | Assembles strokes into item sub-parts (hilt vs blade, robot limbs, duck bill). | At $8 \times 8$, receptive fields span across the entire drawn object, capturing spatial relationships between parts. |
 | **Encoder L4** | `Conv2d(128→256, k=3, s=2, p=1)`<br>`BatchNorm2d` + `LeakyReLU(0.2)` | `[B, 256, 4, 4]` | Aggregates global topological proportions and symmetry axes. | Condenses structural geometry into high-level semantics independent of local jitter. |
 | **Encoder L5** | `Conv2d(256→512, k=3, s=2, p=1)`<br>`BatchNorm2d` + `LeakyReLU(0.2)` | `[B, 512, 2, 2]` | Final spatial compression before semantic projection. | Generates a compact spatial representation with 512 feature descriptors. |
-| **Latent Projection** | `Flatten` + `Linear(2048→512)` | `[B, 512]` | Projects 2D spatial feature map into global latent embedding $z \in \mathbb{R}^{512}$. | Creates a unified view-invariant representation connecting 2D sketches to 3D voxel space; used for class centroid clustering and OOD distance gating. |
-| **Head A (Category)** | `Linear(512→128)` + `LeakyReLU`<br>`Linear(128→11)` | `[B, 11]` | Classifies item archetype across 11 classes. | Provides classification probabilities. Enables gating invalid doodles via softmax confidence threshold $\tau = 0.60$. |
+| **Latent Projection** | `Flatten` + `Linear(2048→512)` | `[B, 512]` | Projects 2D spatial feature map into global latent embedding $z \in \mathbb{R}^{512}$. | Creates a unified view-invariant representation connecting 2D sketches to 3D voxel space; used for class centroid clustering, latent blending, and OOD distance gating. |
+| **Head A (Category)** | `Linear(512→128)` + `LeakyReLU`<br>`Linear(128→12)` | `[B, 12]` | Classifies item archetype across 11 canonical classes + 1 dedicated synthetic OOD class. | Provides classification probabilities. Enables majority labeling, hybrid detection, and OOD rejection. |
 | **Head B (Perspective)** | `Linear(512→128)` + `LeakyReLU`<br>`Linear(128→3)` | `[B, 3]` | Disambiguates drawing viewpoint (`Front_XY`, `Side_ZY`, `Top_XZ`). | Solves single-view projection ambiguity, allowing Unity to automatically counter-rotate the spawned 3D mesh. |
 | **Decoder Seed** | `Linear(512→8192)` + `Reshape` | `[B, 128, 4, 4, 4]` | Unflattens 1D latent vector into initial 3D volumetric seed. | Bridges abstract semantic space back into 3D volumetric coordinates ($4^3$ grid with 128 feature channels). |
 | **Decoder L1** | `ConvTranspose3d(128→64, k=4, s=2, p=1)`<br>`BatchNorm3d` + `LeakyReLU(0.2)` | `[B, 64, 8, 8, 8]` | Upsamples volume $2\times$; establishes primary volumetric mass. | 3D transposed convolution with kernel 4 and stride 2 performs smooth volumetric interpolation without checkerboard artifacts. |
 | **Decoder L2** | `ConvTranspose3d(64→32, k=4, s=2, p=1)`<br>`BatchNorm3d` + `LeakyReLU(0.2)` | `[B, 32, 16, 16, 16]` | Upsamples volume to $16^3$; outlines macroscopic boundaries. | Adds geometric definition to handles, barrels, shields, and animal appendages. |
 | **Decoder L3** | `ConvTranspose3d(32→16, k=4, s=2, p=1)`<br>`BatchNorm3d` + `LeakyReLU(0.2)` | `[B, 16, 32, 32, 32]` | Upsamples volume to $32^3$; refines voxel boundaries and palette transitions. | Segregates surface voxels from interior solid voxels and isolates color regions. |
-| **Decoder L4 (Output)**| `ConvTranspose3d(16→4, k=4, s=2, p=1)`<br>`Sigmoid()` | `[B, 4, 64, 64, 64]` | Synthesizes full $64^3$ voxel grid (Channel 0: Occupancy; Channels 1–3: RGB). | Sigmoid activation bounds all 4 outputs strictly into $[0.0, 1.0]$, preventing gradient explosion and guaranteeing stable vertex color mapping. |
+| **Decoder Head Occ**| `ConvTranspose3d(16→1, k=4, s=2, p=1)`<br>`Sigmoid()` | `[B, 1, 64, 64, 64]` | Synthesizes full $64^3$ binary voxel occupancy probabilities. | Decoupling occupancy from color prediction improves interior solid volume convergence. |
+| **Decoder Head RGB**| `ConvTranspose3d(16→3, k=4, s=2, p=1)`<br>`Sigmoid()` | `[B, 3, 64, 64, 64]` | Synthesizes full $64^3$ RGB color channels. | Dedicated head ensures vibrant vertex colors without interfering with occupancy thresholding. |
 
 ---
 
@@ -220,8 +235,9 @@ Trained on an NVIDIA RTX 4050 GPU for 18 epochs using AdamW optimizer ($\text{lr
 
 ### 3. Interactive Desktop Testing Harness (`MousePaintCanvas.cs`)
 - In-editor desktop test harness allowing players to draw freehand with mouse or load multi-category presets (**Broadsword**, **Tactical Pistol**, **Sci-Fi Blaster**, **Teddy Bear**, **Rubber Duck**, **Retro TV**, **Game Boy**).
-- Real-time **Stroke Feasibility Meter** that evaluates silhouette thickness and coverage before triggering 3D voxel reconstruction.
-- Real-time inference HUD showing classified category, detected perspective plane, softmax confidence percentage, and inference latency in milliseconds.
+- **Instant Holographic Wireframe Preview:** Upon stroke release, instantly generates a 3D cyan wireframe mesh in $<0.5$ ms using Burst jobs, completely masking neural network latency before seamlessly swapping to the fully textured voxel mesh.
+- **2-Channel Distance-Field Preprocessor:** Computes tight AABB scaling and 2-pass Euclidean distance transform directly in C# prior to inference.
+- Real-time inference HUD showing classified category, hybrid status badges (`[HYBRID TOYS]`, `[HYBRID WEAPONS]`), detected perspective plane, confidence percentage, voxel count, and inference latency in milliseconds.
 
 ---
 
@@ -232,9 +248,10 @@ Trained on an NVIDIA RTX 4050 GPU for 18 epochs using AdamW optimizer ($\text{lr
 ├── Assets/
 │   ├── ML/
 │   │   └── Models/
-│   │       ├── draw2voxel_multitask.onnx           # 29 MB multi-task Sentis model
+│   │       ├── draw2voxel_multitask.onnx           # 29 MB multi-task Sentis model (Encoder + Class/View Heads + Decoder)
+│   │       ├── draw2voxel_decoder.onnx             # 18.7 MB standalone 3D decoder for latent blending & canonical snapping
 │   │       ├── draw2voxel_multitask.pt             # PyTorch model weights checkpoint
-│   │       ├── draw2voxel_multitask_centroids.json # Latent centroids for OOD rejection
+│   │       ├── draw2voxel_multitask_centroids.json # Latent centroids for OOD rejection & blending
 │   │       ├── draw2voxel_v1.onnx                  # Legacy 32³ prototype model
 │   │       └── draw2voxel_v1.pt                    # Legacy 32³ checkpoint
 │   ├── Scripts/
@@ -242,7 +259,7 @@ Trained on an NVIDIA RTX 4050 GPU for 18 epochs using AdamW optimizer ($\text{lr
 │   │   │   ├── DrawingCanvasProjector.cs           # 3D spatial stroke rasterizer
 │   │   │   └── StrokeManager.cs                   # Hand gesture stroke collector
 │   │   ├── Inference/
-│   │   │   ├── SentisMultiTaskEngine.cs            # Multi-task Sentis inference engine (11 classes)
+│   │   │   ├── SentisMultiTaskEngine.cs            # Multi-task Sentis engine (Majority labeling, Blending, Hull Prior)
 │   │   │   └── SentisVoxelEngine.cs                # Legacy single-task fallback engine
 │   │   ├── Interaction/
 │   │   │   ├── RPSDetector.cs                      # Mixed reality hand gesture detector

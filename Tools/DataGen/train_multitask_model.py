@@ -371,8 +371,79 @@ def train_multitask(dataset_path, epochs=15, batch_size=32, lr=1e-3, onnx_out="A
         json.dump(centroids, f, indent=2)
     print(f"[Centroids] Exported latent centroids to {centroid_json_path}")
 
-    # Export to multi-output ONNX
+    # Export to multi-output ONNX (full multitask model)
     export_multitask_onnx(model, onnx_out)
+
+    # Export standalone 3D decoder ONNX model (for canonical snapping and hybrid latent blending)
+    decoder_out = onnx_out.replace(".onnx", "").replace("_multitask", "") + "_decoder.onnx"
+    export_decoder_onnx(model, decoder_out)
+
+class AntiGravityDecoderNet(nn.Module):
+    def __init__(self, latent_dim=512):
+        super().__init__()
+        self.fc_dec = nn.Linear(latent_dim, 128 * 4 * 4 * 4)
+        self.decoder_trunk = nn.Sequential(
+            nn.ConvTranspose3d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.ConvTranspose3d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(32),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            nn.ConvTranspose3d(32, 16, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(16),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.head_occ = nn.Sequential(
+            nn.ConvTranspose3d(16, 1, kernel_size=4, stride=2, padding=1),
+            nn.Sigmoid()
+        )
+        self.head_rgb = nn.Sequential(
+            nn.ConvTranspose3d(16, 3, kernel_size=4, stride=2, padding=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, z):
+        vol_init = self.fc_dec(z).view(-1, 128, 4, 4, 4)
+        vol_feat = self.decoder_trunk(vol_init)
+        voxel_occ = self.head_occ(vol_feat)
+        voxel_rgb = self.head_rgb(vol_feat)
+        return voxel_occ, voxel_rgb
+
+def export_decoder_onnx(full_model, decoder_out):
+    print(f"[ONNX Export] Exporting standalone 3D decoder to {decoder_out} for latent blending...")
+    full_model.eval().to("cpu")
+
+    decoder_net = AntiGravityDecoderNet(latent_dim=full_model.latent_dim)
+    decoder_net.fc_dec.load_state_dict(full_model.fc_dec.state_dict())
+    decoder_net.decoder_trunk.load_state_dict(full_model.decoder_trunk.state_dict())
+    decoder_net.head_occ.load_state_dict(full_model.head_occ.state_dict())
+    decoder_net.head_rgb.load_state_dict(full_model.head_rgb.state_dict())
+    decoder_net.eval()
+
+    dummy_z = torch.randn(1, full_model.latent_dim, device="cpu")
+    os.makedirs(os.path.dirname(os.path.abspath(decoder_out)), exist_ok=True)
+
+    torch.onnx.export(
+        decoder_net,
+        dummy_z,
+        decoder_out,
+        export_params=True,
+        opset_version=14,
+        do_constant_folding=True,
+        input_names=['latent_z'],
+        output_names=['voxel_occupancy', 'voxel_rgb'],
+        dynamo=False
+    )
+
+    import onnx
+    onnx_model = onnx.load(decoder_out)
+    onnx.checker.check_model(onnx_model)
+    file_size_mb = os.path.getsize(decoder_out) / (1024 * 1024)
+    print(f"[ONNX Export] Successfully verified 3D decoder ONNX model! File size: {file_size_mb:.2f} MB")
+    print("  Decoder Graph Inputs:", [(i.name, [d.dim_value for d in i.type.tensor_type.shape.dim]) for i in onnx_model.graph.input])
+    print("  Decoder Graph Outputs:", [(o.name, [d.dim_value for d in o.type.tensor_type.shape.dim]) for o in onnx_model.graph.output])
 
 def export_multitask_onnx(model, onnx_out):
     print(f"[ONNX Export] Exporting multi-task model to {onnx_out} for Unity Sentis...")
@@ -411,3 +482,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     train_multitask(args.data, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, onnx_out=args.out)
+

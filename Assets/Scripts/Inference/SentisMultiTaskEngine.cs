@@ -328,13 +328,13 @@ namespace VRDraw2Voxel.Inference
             // Yield frame so GPU compute executes without blocking VR render thread
             yield return null;
 
-            // Retrieve multi-output tensors: separate voxel_occupancy & voxel_rgb, or legacy output_voxels_4ch
-            Tensor<float> occTensor = _worker.PeekOutput("voxel_occupancy") as Tensor<float>;
-            Tensor<float> rgbTensor = _worker.PeekOutput("voxel_rgb") as Tensor<float>;
-            Tensor<float> legacyVoxTensor = _worker.PeekOutput("output_voxels_4ch") as Tensor<float>;
-            Tensor<float> catLogitsTensor = _worker.PeekOutput("category_logits") as Tensor<float>;
-            Tensor<float> viewLogitsTensor = _worker.PeekOutput("view_logits") as Tensor<float>;
-            Tensor<float> latentTensor = _worker.PeekOutput("latent_z") as Tensor<float>;
+            // Retrieve multi-output tensors safely: separate voxel_occupancy & voxel_rgb, or legacy output_voxels_4ch
+            Tensor<float> occTensor = HasOutput(_runtimeModel, "voxel_occupancy") ? _worker.PeekOutput("voxel_occupancy") as Tensor<float> : null;
+            Tensor<float> rgbTensor = HasOutput(_runtimeModel, "voxel_rgb") ? _worker.PeekOutput("voxel_rgb") as Tensor<float> : null;
+            Tensor<float> legacyVoxTensor = HasOutput(_runtimeModel, "output_voxels_4ch") ? _worker.PeekOutput("output_voxels_4ch") as Tensor<float> : null;
+            Tensor<float> catLogitsTensor = HasOutput(_runtimeModel, "category_logits") ? _worker.PeekOutput("category_logits") as Tensor<float> : null;
+            Tensor<float> viewLogitsTensor = HasOutput(_runtimeModel, "view_logits") ? _worker.PeekOutput("view_logits") as Tensor<float> : null;
+            Tensor<float> latentTensor = HasOutput(_runtimeModel, "latent_z") ? _worker.PeekOutput("latent_z") as Tensor<float> : null;
 
             if ((occTensor == null && legacyVoxTensor == null) || catLogitsTensor == null || viewLogitsTensor == null)
             {
@@ -365,7 +365,7 @@ namespace VRDraw2Voxel.Inference
                 rawOcc = occCpu.DownloadToArray();
                 rawRgb = rgbCpu.DownloadToArray();
             }
-            else
+            else if (legacyVoxTensor != null)
             {
                 using Tensor<float> voxCpu = legacyVoxTensor.ReadbackAndClone();
                 rawLegacyVox4Ch = voxCpu.DownloadToArray();
@@ -375,15 +375,15 @@ namespace VRDraw2Voxel.Inference
             _worker.Schedule(inputTensor);
             yield return null;
 
-            TensorFloat occTensor = _worker.PeekOutput("voxel_occupancy") as TensorFloat;
-            TensorFloat rgbTensor = _worker.PeekOutput("voxel_rgb") as TensorFloat;
-            TensorFloat legacyVoxTensor = _worker.PeekOutput("output_voxels_4ch") as TensorFloat;
-            TensorFloat catLogitsTensor = _worker.PeekOutput("category_logits") as TensorFloat;
-            TensorFloat viewLogitsTensor = _worker.PeekOutput("view_logits") as TensorFloat;
-            TensorFloat latentTensor = _worker.PeekOutput("latent_z") as TensorFloat;
+            TensorFloat occTensor = HasOutput(_runtimeModel, "voxel_occupancy") ? _worker.PeekOutput("voxel_occupancy") as TensorFloat : null;
+            TensorFloat rgbTensor = HasOutput(_runtimeModel, "voxel_rgb") ? _worker.PeekOutput("voxel_rgb") as TensorFloat : null;
+            TensorFloat legacyVoxTensor = HasOutput(_runtimeModel, "output_voxels_4ch") ? _worker.PeekOutput("output_voxels_4ch") as TensorFloat : null;
+            TensorFloat catLogitsTensor = HasOutput(_runtimeModel, "category_logits") ? _worker.PeekOutput("category_logits") as TensorFloat : null;
+            TensorFloat viewLogitsTensor = HasOutput(_runtimeModel, "view_logits") ? _worker.PeekOutput("view_logits") as TensorFloat : null;
+            TensorFloat latentTensor = HasOutput(_runtimeModel, "latent_z") ? _worker.PeekOutput("latent_z") as TensorFloat : null;
 
-            float[] catLogits = catLogitsTensor.ToReadOnlyArray();
-            float[] viewLogits = viewLogitsTensor.ToReadOnlyArray();
+            float[] catLogits = catLogitsTensor != null ? catLogitsTensor.ToReadOnlyArray() : new float[0];
+            float[] viewLogits = viewLogitsTensor != null ? viewLogitsTensor.ToReadOnlyArray() : new float[0];
             float[] latentZ = latentTensor != null ? latentTensor.ToReadOnlyArray() : null;
             float[] rawOcc = occTensor != null ? occTensor.ToReadOnlyArray() : null;
             float[] rawRgb = rgbTensor != null ? rgbTensor.ToReadOnlyArray() : null;
@@ -473,8 +473,8 @@ namespace VRDraw2Voxel.Inference
                 _decoderWorker.Schedule(zTensor);
                 yield return null;
 
-                Tensor<float> decOccTensor = _decoderWorker.PeekOutput("voxel_occupancy") as Tensor<float>;
-                Tensor<float> decRgbTensor = _decoderWorker.PeekOutput("voxel_rgb") as Tensor<float>;
+                Tensor<float> decOccTensor = HasOutput(_runtimeDecoderModel, "voxel_occupancy") ? _decoderWorker.PeekOutput("voxel_occupancy") as Tensor<float> : null;
+                Tensor<float> decRgbTensor = HasOutput(_runtimeDecoderModel, "voxel_rgb") ? _decoderWorker.PeekOutput("voxel_rgb") as Tensor<float> : null;
 
                 if (decOccTensor != null && decRgbTensor != null)
                 {
@@ -488,8 +488,8 @@ namespace VRDraw2Voxel.Inference
                 _decoderWorker.Schedule(zTensor);
                 yield return null;
 
-                TensorFloat decOccTensor = _decoderWorker.PeekOutput("voxel_occupancy") as TensorFloat;
-                TensorFloat decRgbTensor = _decoderWorker.PeekOutput("voxel_rgb") as TensorFloat;
+                TensorFloat decOccTensor = HasOutput(_runtimeDecoderModel, "voxel_occupancy") ? _decoderWorker.PeekOutput("voxel_occupancy") as TensorFloat : null;
+                TensorFloat decRgbTensor = HasOutput(_runtimeDecoderModel, "voxel_rgb") ? _decoderWorker.PeekOutput("voxel_rgb") as TensorFloat : null;
 
                 if (decOccTensor != null && decRgbTensor != null)
                 {
@@ -914,6 +914,16 @@ namespace VRDraw2Voxel.Inference
                 exp[i] /= sumExp;
             }
             return exp;
+        }
+
+        private bool HasOutput(Model model, string outputName)
+        {
+            if (model == null || model.outputs == null) return false;
+            for (int i = 0; i < model.outputs.Count; i++)
+            {
+                if (model.outputs[i].name == outputName) return true;
+            }
+            return false;
         }
     }
 }

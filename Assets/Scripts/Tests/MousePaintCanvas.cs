@@ -31,6 +31,10 @@ namespace VRDraw2Voxel.Tests
         [Header("Showcase Pedestal / Camera")]
         [SerializeField] private bool autoPositionCamera = true;
 
+        [Header("Preview Settings")]
+        [Tooltip("Render an instant extruded wireframe preview while inference runs.")]
+        [SerializeField] private bool showHolographicWireframePreview = false;
+
         private Texture2D _drawTexture;
         private Color32[] _texturePixels;
         private Vector2? _lastMousePixel;
@@ -312,8 +316,11 @@ namespace VRDraw2Voxel.Tests
             float aspectRatio, fillDensity;
             float[] inputBuffer2Ch = PreprocessToTwoChannel64x64(out strokeMask, out aspectRatio, out fillDensity);
 
-            // Instant holographic wireframe preview (<0.5ms Burst mesh generation)
-            ShowHolographicWireframePreview(strokeMask);
+            // Optional instant holographic wireframe preview (<0.5ms Burst mesh generation)
+            if (showHolographicWireframePreview)
+            {
+                ShowHolographicWireframePreview(strokeMask);
+            }
 
             if (multiTaskEngine != null)
             {

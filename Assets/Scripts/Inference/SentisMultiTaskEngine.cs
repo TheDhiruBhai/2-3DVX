@@ -25,6 +25,7 @@ namespace VRDraw2Voxel.Inference
         Gamepad = 8,
         RetroTV = 9,
         GameBoy = 10,
+        OOD_Reject = 11,
         Unknown = -1
     }
 
@@ -51,6 +52,7 @@ namespace VRDraw2Voxel.Inference
     /// <summary>
     /// Executes the multi-task AntiGravity Draw2Voxel ONNX model in Unity Sentis / Inference Engine.
     /// Disambiguates perspective (Front/Side/Top), classifies object category with OOD rejection,
+    /// feeds a 2-channel (Stroke + Distance Field) input tensor, applies GATOR Visual-Hull prior masking,
     /// and extracts a 64x64x64 colored 3D voxel grid within VR frame budgets (<15 ms).
     /// </summary>
     public class SentisMultiTaskEngine : MonoBehaviour
@@ -63,6 +65,14 @@ namespace VRDraw2Voxel.Inference
         [Tooltip("Minimum softmax probability required to accept drawing as valid shape.")]
         [Range(0.3f, 0.95f)]
         [SerializeField] private float oodConfidenceThreshold = 0.60f;
+
+        [Header("Visual-Hull Prior (GATOR)")]
+        [Tooltip("Constrains decoded voxels to the extruded 2D sketch bounding envelope to eliminate empty space hallucinations.")]
+        [SerializeField] private bool applyVisualHullPrior = true;
+
+        [Tooltip("Margin dilation applied to the 2D bounding envelope before extrusion.")]
+        [Range(0, 5)]
+        [SerializeField] private int envelopeDilation = 2;
 
         [Header("Occupancy & Island Post-Processing")]
         [Tooltip("Binary occupancy threshold for voxel decoder. Higher values eliminate boundary floating dust.")]
@@ -124,7 +134,8 @@ namespace VRDraw2Voxel.Inference
         }
 
         /// <summary>
-        /// Dispatches a 64x64 float input sketch to the multi-task network.
+        /// Dispatches a 2-channel [1, 2, 64, 64] float input sketch to the multi-task network.
+        /// Accepts either 8192 floats (Channel 0 Stroke + Channel 1 Distance Field) or 4096 floats (auto-computes Ch1).
         /// Asynchronously yields across frames to maintain VR frame rates.
         /// </summary>
         public void PredictMultiTaskAsync(float[] rasterBuffer, Action<MultiTaskInferenceResult> callback = null)
@@ -135,62 +146,90 @@ namespace VRDraw2Voxel.Inference
                 return;
             }
 
-            if (rasterBuffer == null || rasterBuffer.Length != InputRes * InputRes)
+            if (rasterBuffer == null || (rasterBuffer.Length != InputRes * InputRes && rasterBuffer.Length != 2 * InputRes * InputRes))
             {
-                Debug.LogError($"[SentisMultiTaskEngine] Invalid raster buffer length: {rasterBuffer?.Length}. Expected {InputRes * InputRes}.");
+                Debug.LogError($"[SentisMultiTaskEngine] Invalid raster buffer length: {rasterBuffer?.Length}. Expected {InputRes * InputRes} or {2 * InputRes * InputRes}.");
                 return;
             }
 
-            StartCoroutine(ExecuteMultiTaskCoroutine(rasterBuffer, callback));
+            float[] buffer2Ch;
+            if (rasterBuffer.Length == 2 * InputRes * InputRes)
+            {
+                buffer2Ch = rasterBuffer;
+            }
+            else
+            {
+                buffer2Ch = BuildTwoChannelBuffer(rasterBuffer);
+            }
+
+            StartCoroutine(ExecuteMultiTaskCoroutine(buffer2Ch, callback));
         }
 
-        private IEnumerator ExecuteMultiTaskCoroutine(float[] rasterBuffer, Action<MultiTaskInferenceResult> callback)
+        private IEnumerator ExecuteMultiTaskCoroutine(float[] buffer2Ch, Action<MultiTaskInferenceResult> callback)
         {
             float startTime = Time.realtimeSinceStartup;
-            TensorShape inputShape = new TensorShape(1, 1, InputRes, InputRes);
+            TensorShape inputShape = new TensorShape(1, 2, InputRes, InputRes);
 
 #if UNITY_6000_0_OR_NEWER || UNITY_INFERENCE_ENGINE
-            using Tensor<float> inputTensor = new Tensor<float>(inputShape, rasterBuffer);
+            using Tensor<float> inputTensor = new Tensor<float>(inputShape, buffer2Ch);
             _worker.Schedule(inputTensor);
 
             // Yield frame so GPU compute executes without blocking VR render thread
             yield return null;
 
-            // Retrieve multi-output tensors
-            Tensor<float> voxelsTensor = _worker.PeekOutput("output_voxels_4ch") as Tensor<float>;
+            // Retrieve multi-output tensors: separate voxel_occupancy & voxel_rgb, or legacy output_voxels_4ch
+            Tensor<float> occTensor = _worker.PeekOutput("voxel_occupancy") as Tensor<float>;
+            Tensor<float> rgbTensor = _worker.PeekOutput("voxel_rgb") as Tensor<float>;
+            Tensor<float> legacyVoxTensor = _worker.PeekOutput("output_voxels_4ch") as Tensor<float>;
             Tensor<float> catLogitsTensor = _worker.PeekOutput("category_logits") as Tensor<float>;
             Tensor<float> viewLogitsTensor = _worker.PeekOutput("view_logits") as Tensor<float>;
 
-            if (voxelsTensor == null || catLogitsTensor == null || viewLogitsTensor == null)
+            if ((occTensor == null && legacyVoxTensor == null) || catLogitsTensor == null || viewLogitsTensor == null)
             {
                 Debug.LogError("[SentisMultiTaskEngine] Failed to retrieve one or more output tensors.");
                 yield break;
             }
 
-            // Readback logits (very small tensors: 3 floats each)
             using Tensor<float> catCpu = catLogitsTensor.ReadbackAndClone();
             using Tensor<float> viewCpu = viewLogitsTensor.ReadbackAndClone();
             float[] catLogits = catCpu.DownloadToArray();
             float[] viewLogits = viewCpu.DownloadToArray();
 
-            // Readback 4-channel 64^3 voxel tensor
-            using Tensor<float> voxCpu = voxelsTensor.ReadbackAndClone();
-            float[] rawVoxels4Ch = voxCpu.DownloadToArray();
+            float[] rawOcc = null;
+            float[] rawRgb = null;
+            float[] rawLegacyVox4Ch = null;
+
+            if (occTensor != null && rgbTensor != null)
+            {
+                using Tensor<float> occCpu = occTensor.ReadbackAndClone();
+                using Tensor<float> rgbCpu = rgbTensor.ReadbackAndClone();
+                rawOcc = occCpu.DownloadToArray();
+                rawRgb = rgbCpu.DownloadToArray();
+            }
+            else
+            {
+                using Tensor<float> voxCpu = legacyVoxTensor.ReadbackAndClone();
+                rawLegacyVox4Ch = voxCpu.DownloadToArray();
+            }
 #else
-            using TensorFloat inputTensor = new TensorFloat(inputShape, rasterBuffer);
+            using TensorFloat inputTensor = new TensorFloat(inputShape, buffer2Ch);
             _worker.Schedule(inputTensor);
             yield return null;
 
-            TensorFloat voxelsTensor = _worker.PeekOutput("output_voxels_4ch") as TensorFloat;
+            TensorFloat occTensor = _worker.PeekOutput("voxel_occupancy") as TensorFloat;
+            TensorFloat rgbTensor = _worker.PeekOutput("voxel_rgb") as TensorFloat;
+            TensorFloat legacyVoxTensor = _worker.PeekOutput("output_voxels_4ch") as TensorFloat;
             TensorFloat catLogitsTensor = _worker.PeekOutput("category_logits") as TensorFloat;
             TensorFloat viewLogitsTensor = _worker.PeekOutput("view_logits") as TensorFloat;
 
             float[] catLogits = catLogitsTensor.ToReadOnlyArray();
             float[] viewLogits = viewLogitsTensor.ToReadOnlyArray();
-            float[] rawVoxels4Ch = voxelsTensor.ToReadOnlyArray();
+            float[] rawOcc = occTensor != null ? occTensor.ToReadOnlyArray() : null;
+            float[] rawRgb = rgbTensor != null ? rgbTensor.ToReadOnlyArray() : null;
+            float[] rawLegacyVox4Ch = legacyVoxTensor != null ? legacyVoxTensor.ToReadOnlyArray() : null;
 #endif
 
-            // 1. Evaluate Category Softmax & OOD Rejection
+            // 1. Evaluate Category Softmax & OOD Rejection (12 classes: 0..10 canonical, 11 OOD_Reject)
             float[] catSoftmax = ComputeSoftmax(catLogits);
             int bestCatIdx = 0;
             float bestCatProb = catSoftmax[0];
@@ -203,8 +242,8 @@ namespace VRDraw2Voxel.Inference
                 }
             }
 
-            bool isOOD = bestCatProb < oodConfidenceThreshold;
-            ReconstructedCategory cat = isOOD ? ReconstructedCategory.Unknown : (ReconstructedCategory)bestCatIdx;
+            bool isOOD = (bestCatIdx == (int)ReconstructedCategory.OOD_Reject) || (bestCatProb < oodConfidenceThreshold);
+            ReconstructedCategory cat = isOOD ? ReconstructedCategory.OOD_Reject : (ReconstructedCategory)bestCatIdx;
 
             // 2. Evaluate View Disambiguation Softmax
             float[] viewSoftmax = ComputeSoftmax(viewLogits);
@@ -221,29 +260,68 @@ namespace VRDraw2Voxel.Inference
             PerspectiveView detectedView = (PerspectiveView)bestViewIdx;
 
             // 3. Process 64^3 Occupancy & Color Palettes
-            // Channel 0: Occupancy, Channel 1: R, Channel 2: G, Channel 3: B
             byte[] occupancyGrid = new byte[TotalVoxels];
             Color32[] voxelColors = new Color32[TotalVoxels];
 
-            int chStride = TotalVoxels;
-            int rOffset = chStride;
-            int gOffset = chStride * 2;
-            int bOffset = chStride * 3;
-
-            for (int i = 0; i < TotalVoxels; i++)
+            if (rawOcc != null && rawRgb != null)
             {
-                float occ = rawVoxels4Ch[i];
-                if (occ >= occupancyThreshold)
+                int rOffset = 0;
+                int gOffset = TotalVoxels;
+                int bOffset = TotalVoxels * 2;
+
+                for (int i = 0; i < TotalVoxels; i++)
                 {
-                    occupancyGrid[i] = 1;
-                    byte r = (byte)Mathf.Clamp((int)(rawVoxels4Ch[rOffset + i] * 255.0f), 0, 255);
-                    byte g = (byte)Mathf.Clamp((int)(rawVoxels4Ch[gOffset + i] * 255.0f), 0, 255);
-                    byte b = (byte)Mathf.Clamp((int)(rawVoxels4Ch[bOffset + i] * 255.0f), 0, 255);
-                    voxelColors[i] = new Color32(r, g, b, 255);
+                    float occ = rawOcc[i];
+                    if (occ >= occupancyThreshold)
+                    {
+                        occupancyGrid[i] = 1;
+                        byte r = (byte)Mathf.Clamp((int)(rawRgb[rOffset + i] * 255.0f), 0, 255);
+                        byte g = (byte)Mathf.Clamp((int)(rawRgb[gOffset + i] * 255.0f), 0, 255);
+                        byte b = (byte)Mathf.Clamp((int)(rawRgb[bOffset + i] * 255.0f), 0, 255);
+                        voxelColors[i] = new Color32(r, g, b, 255);
+                    }
+                    else
+                    {
+                        occupancyGrid[i] = 0;
+                    }
                 }
-                else
+            }
+            else if (rawLegacyVox4Ch != null)
+            {
+                int chStride = TotalVoxels;
+                int rOffset = chStride;
+                int gOffset = chStride * 2;
+                int bOffset = chStride * 3;
+
+                for (int i = 0; i < TotalVoxels; i++)
                 {
-                    occupancyGrid[i] = 0;
+                    float occ = rawLegacyVox4Ch[i];
+                    if (occ >= occupancyThreshold)
+                    {
+                        occupancyGrid[i] = 1;
+                        byte r = (byte)Mathf.Clamp((int)(rawLegacyVox4Ch[rOffset + i] * 255.0f), 0, 255);
+                        byte g = (byte)Mathf.Clamp((int)(rawLegacyVox4Ch[gOffset + i] * 255.0f), 0, 255);
+                        byte b = (byte)Mathf.Clamp((int)(rawLegacyVox4Ch[bOffset + i] * 255.0f), 0, 255);
+                        voxelColors[i] = new Color32(r, g, b, 255);
+                    }
+                    else
+                    {
+                        occupancyGrid[i] = 0;
+                    }
+                }
+            }
+
+            // 3.5. GATOR Visual-Hull Intersection Masking
+            // Multiplies decoded 3D occupancy by the extruded 2D envelope to eliminate empty space hallucinations
+            if (applyVisualHullPrior && !isOOD)
+            {
+                float[] ch0Stroke = new float[InputRes * InputRes];
+                Array.Copy(buffer2Ch, 0, ch0Stroke, 0, InputRes * InputRes);
+                byte[] envelope2D = ComputeVisualHullEnvelope2D(ch0Stroke, envelopeDilation);
+                int culledByHull = ApplyVisualHullMasking(occupancyGrid, envelope2D, detectedView);
+                if (culledByHull > 0)
+                {
+                    Debug.Log($"[SentisMultiTaskEngine] GATOR Visual-Hull prior masked {culledByHull} voxels outside 2D contour envelope.");
                 }
             }
 
@@ -273,6 +351,214 @@ namespace VRDraw2Voxel.Inference
             Debug.Log($"[SentisMultiTaskEngine] Done: Cat={cat} ({bestCatProb*100:F1}%), View={detectedView} ({bestViewProb*100:F1}%), OOD={isOOD}, Latency={latency:F1}ms");
             OnInferenceComplete?.Invoke(result);
             callback?.Invoke(result);
+        }
+
+        // ==============================================================================
+        // GATOR VISUAL-HULL PRIOR & 2-CHANNEL PIPELINE HELPERS
+        // ==============================================================================
+
+        /// <summary>
+        /// Computes the 2D bounding envelope (filled silhouette) from a stroke mask using flood-fill and morphological dilation.
+        /// </summary>
+        public static byte[] ComputeVisualHullEnvelope2D(float[] strokeMask, int marginDilation = 2)
+        {
+            byte[] env = new byte[InputRes * InputRes];
+            bool[] isStroke = new bool[InputRes * InputRes];
+            for (int i = 0; i < isStroke.Length; i++)
+            {
+                if (strokeMask[i] > 0.2f) isStroke[i] = true;
+            }
+
+            // Dilate stroke by 2 pixels to bridge small unclosed stroke gaps
+            bool[] closedStroke = DilateBinary2D(isStroke, 2);
+
+            // Flood-fill exterior from all 4 borders
+            bool[] exterior = new bool[InputRes * InputRes];
+            Queue<int> q = new Queue<int>(256);
+
+            for (int x = 0; x < InputRes; x++)
+            {
+                int top = x * InputRes + 0;
+                int btm = x * InputRes + (InputRes - 1);
+                if (!closedStroke[top] && !exterior[top]) { exterior[top] = true; q.Enqueue(top); }
+                if (!closedStroke[btm] && !exterior[btm]) { exterior[btm] = true; q.Enqueue(btm); }
+            }
+            for (int y = 0; y < InputRes; y++)
+            {
+                int left = 0 * InputRes + y;
+                int right = (InputRes - 1) * InputRes + y;
+                if (!closedStroke[left] && !exterior[left]) { exterior[left] = true; q.Enqueue(left); }
+                if (!closedStroke[right] && !exterior[right]) { exterior[right] = true; q.Enqueue(right); }
+            }
+
+            int[] dx = { 1, -1, 0, 0 };
+            int[] dy = { 0, 0, 1, -1 };
+
+            while (q.Count > 0)
+            {
+                int cur = q.Dequeue();
+                int cx = cur / InputRes;
+                int cy = cur % InputRes;
+
+                for (int d = 0; d < 4; d++)
+                {
+                    int nx = cx + dx[d];
+                    int ny = cy + dy[d];
+                    if (nx >= 0 && nx < InputRes && ny >= 0 && ny < InputRes)
+                    {
+                        int nIdx = nx * InputRes + ny;
+                        if (!closedStroke[nIdx] && !exterior[nIdx])
+                        {
+                            exterior[nIdx] = true;
+                            q.Enqueue(nIdx);
+                        }
+                    }
+                }
+            }
+
+            // Interior envelope is everything not reachable from border
+            bool[] interior = new bool[InputRes * InputRes];
+            for (int i = 0; i < interior.Length; i++)
+            {
+                interior[i] = !exterior[i];
+            }
+
+            // Dilate envelope by margin
+            bool[] dilatedEnvelope = marginDilation > 0 ? DilateBinary2D(interior, marginDilation) : interior;
+            for (int i = 0; i < env.Length; i++)
+            {
+                env[i] = dilatedEnvelope[i] ? (byte)1 : (byte)0;
+            }
+            return env;
+        }
+
+        private static bool[] DilateBinary2D(bool[] src, int iterations)
+        {
+            bool[] cur = (bool[])src.Clone();
+            bool[] next = new bool[src.Length];
+
+            for (int it = 0; it < iterations; it++)
+            {
+                Array.Copy(cur, next, src.Length);
+                for (int x = 0; x < InputRes; x++)
+                {
+                    for (int y = 0; y < InputRes; y++)
+                    {
+                        if (cur[x * InputRes + y])
+                        {
+                            if (x > 0) next[(x - 1) * InputRes + y] = true;
+                            if (x < InputRes - 1) next[(x + 1) * InputRes + y] = true;
+                            if (y > 0) next[x * InputRes + (y - 1)] = true;
+                            if (y < InputRes - 1) next[x * InputRes + (y + 1)] = true;
+                        }
+                    }
+                }
+                bool[] tmp = cur;
+                cur = next;
+                next = tmp;
+            }
+            return cur;
+        }
+
+        private int ApplyVisualHullMasking(byte[] occupancy, byte[] envelope2D, PerspectiveView view)
+        {
+            int culledCount = 0;
+            for (int x = 0; x < VoxelDim; x++)
+            {
+                for (int y = 0; y < VoxelDim; y++)
+                {
+                    for (int z = 0; z < VoxelDim; z++)
+                    {
+                        int flatIdx = x * (VoxelDim * VoxelDim) + y * VoxelDim + z;
+                        if (occupancy[flatIdx] == 0) continue;
+
+                        int u = 0, v = 0;
+                        switch (view)
+                        {
+                            case PerspectiveView.Front_XY:
+                                u = x;
+                                v = y;
+                                break;
+                            case PerspectiveView.Side_ZY:
+                                u = z;
+                                v = y;
+                                break;
+                            case PerspectiveView.Top_XZ:
+                                u = x;
+                                v = z;
+                                break;
+                        }
+
+                        if (u < 0 || u >= InputRes || v < 0 || v >= InputRes || envelope2D[u * InputRes + v] == 0)
+                        {
+                            occupancy[flatIdx] = 0;
+                            culledCount++;
+                        }
+                    }
+                }
+            }
+            return culledCount;
+        }
+
+        /// <summary>
+        /// Builds a 2-channel normalized buffer [Channel 0: Stroke, Channel 1: SDF] from a single 64x64 stroke buffer.
+        /// </summary>
+        public static float[] BuildTwoChannelBuffer(float[] singleChannelStroke)
+        {
+            float[] buffer2Ch = new float[2 * InputRes * InputRes];
+            Array.Copy(singleChannelStroke, 0, buffer2Ch, 0, InputRes * InputRes);
+
+            // Compute 2-pass Chamfer distance transform for Channel 1
+            float[] dist = new float[InputRes * InputRes];
+            float maxVal = 1e6f;
+            for (int i = 0; i < dist.Length; i++)
+            {
+                dist[i] = singleChannelStroke[i] > 0.2f ? 0.0f : maxVal;
+            }
+
+            float sqrt2 = 1.41421356f;
+            // Forward pass
+            for (int x = 0; x < InputRes; x++)
+            {
+                for (int y = 0; y < InputRes; y++)
+                {
+                    int idx = x * InputRes + y;
+                    if (dist[idx] > 0f)
+                    {
+                        float best = dist[idx];
+                        if (x > 0) best = Mathf.Min(best, dist[(x - 1) * InputRes + y] + 1.0f);
+                        if (y > 0) best = Mathf.Min(best, dist[x * InputRes + (y - 1)] + 1.0f);
+                        if (x > 0 && y > 0) best = Mathf.Min(best, dist[(x - 1) * InputRes + (y - 1)] + sqrt2);
+                        if (x < InputRes - 1 && y > 0) best = Mathf.Min(best, dist[(x + 1) * InputRes + (y - 1)] + sqrt2);
+                        dist[idx] = best;
+                    }
+                }
+            }
+
+            // Backward pass
+            for (int x = InputRes - 1; x >= 0; x--)
+            {
+                for (int y = InputRes - 1; y >= 0; y--)
+                {
+                    int idx = x * InputRes + y;
+                    float best = dist[idx];
+                    if (x < InputRes - 1) best = Mathf.Min(best, dist[(x + 1) * InputRes + y] + 1.0f);
+                    if (y < InputRes - 1) best = Mathf.Min(best, dist[x * InputRes + (y + 1)] + 1.0f);
+                    if (x < InputRes - 1 && y < InputRes - 1) best = Mathf.Min(best, dist[(x + 1) * InputRes + (y + 1)] + sqrt2);
+                    if (x > 0 && y < InputRes - 1) best = Mathf.Min(best, dist[(x - 1) * InputRes + (y + 1)] + sqrt2);
+                    dist[idx] = best;
+                }
+            }
+
+            // Normalize truncated distance field to [0.0, 1.0] (d_max = 16.0f)
+            float dMax = 16.0f;
+            int ch1Offset = InputRes * InputRes;
+            for (int i = 0; i < dist.Length; i++)
+            {
+                buffer2Ch[ch1Offset + i] = Mathf.Clamp01(dist[i] / dMax);
+            }
+
+            return buffer2Ch;
         }
 
         /// <summary>

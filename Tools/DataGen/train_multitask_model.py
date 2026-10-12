@@ -33,7 +33,8 @@ CATEGORY_NAMES = {
     7: "ToyBunny",
     8: "Gamepad",
     9: "RetroTV",
-    10: "GameBoy"
+    10: "GameBoy",
+    11: "OOD_Reject"
 }
 
 VIEW_NAMES = {
@@ -47,14 +48,15 @@ VIEW_NAMES = {
 # ==============================================================================
 
 class AntiGravityMultiTaskNet(nn.Module):
-    def __init__(self, latent_dim=512, num_classes=11):
+    def __init__(self, latent_dim=512, num_classes=12):
         super().__init__()
         self.latent_dim = latent_dim
         self.num_classes = num_classes
 
-        # 1. 2D Convolutional Encoder: 1x64x64 -> Latent z in R^512
+        # 1. 2D Convolutional Encoder: 2x64x64 -> Latent z in R^512
+        # Channel 0: Normalized Stroke Mask, Channel 1: Truncated Distance Field (SDF)
         self.encoder = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),  # -> 32x32
+            nn.Conv2d(2, 32, kernel_size=3, stride=2, padding=1),  # -> 32x32
             nn.BatchNorm2d(32),
             nn.LeakyReLU(0.2, inplace=True),
 
@@ -77,7 +79,7 @@ class AntiGravityMultiTaskNet(nn.Module):
 
         self.fc_latent = nn.Linear(512 * 2 * 2, latent_dim)
 
-        # 2. Classification Head A: Category Softmax
+        # 2. Classification Head A: Category Logits (11 canonical + 1 OOD_Reject)
         self.category_head = nn.Sequential(
             nn.Linear(latent_dim, 128),
             nn.LeakyReLU(0.2, inplace=True),
@@ -91,9 +93,10 @@ class AntiGravityMultiTaskNet(nn.Module):
             nn.Linear(128, 3)
         )
 
-        # 4. 3D Deconvolutional Decoder: Latent z -> [B, 4, 64, 64, 64] (Occupancy + RGB)
+        # 4. 3D Deconvolutional Decoder: Latent z -> 64x64x64 Voxel Space
+        # Shared trunk up to 32x32x32 resolution
         self.fc_dec = nn.Linear(latent_dim, 128 * 4 * 4 * 4)
-        self.decoder_3d = nn.Sequential(
+        self.decoder_trunk = nn.Sequential(
             nn.ConvTranspose3d(128, 64, kernel_size=4, stride=2, padding=1), # -> 8x8x8
             nn.BatchNorm3d(64),
             nn.LeakyReLU(0.2, inplace=True),
@@ -105,8 +108,17 @@ class AntiGravityMultiTaskNet(nn.Module):
             nn.ConvTranspose3d(32, 16, kernel_size=4, stride=2, padding=1),  # -> 32x32x32
             nn.BatchNorm3d(16),
             nn.LeakyReLU(0.2, inplace=True),
+        )
 
-            nn.ConvTranspose3d(16, 4, kernel_size=4, stride=2, padding=1),   # -> 64x64x64
+        # Separate Head 1: Voxel Occupancy [B, 1, 64, 64, 64] (Sigmoid probability)
+        self.head_occ = nn.Sequential(
+            nn.ConvTranspose3d(16, 1, kernel_size=4, stride=2, padding=1),   # -> 64x64x64
+            nn.Sigmoid()
+        )
+
+        # Separate Head 2: Voxel RGB Colors [B, 3, 64, 64, 64] (Sigmoid [0..1] color space)
+        self.head_rgb = nn.Sequential(
+            nn.ConvTranspose3d(16, 3, kernel_size=4, stride=2, padding=1),   # -> 64x64x64
             nn.Sigmoid()
         )
 
@@ -120,9 +132,11 @@ class AntiGravityMultiTaskNet(nn.Module):
         view_logits = self.view_head(z)
 
         vol_init = self.fc_dec(z).view(-1, 128, 4, 4, 4)
-        voxels_4ch = self.decoder_3d(vol_init)
+        vol_feat = self.decoder_trunk(vol_init)
+        voxel_occ = self.head_occ(vol_feat)
+        voxel_rgb = self.head_rgb(vol_feat)
 
-        return voxels_4ch, category_logits, view_logits, z
+        return voxel_occ, voxel_rgb, category_logits, view_logits, z
 
 # ==============================================================================
 # MULTI-TASK LOSS FUNCTION
@@ -136,15 +150,13 @@ class MultiTaskVoxelLoss(nn.Module):
         self.ce_cat = nn.CrossEntropyLoss()
         self.ce_view = nn.CrossEntropyLoss()
 
-    def forward(self, pred_vox, pred_cat, pred_view, tgt_vox, tgt_cat, tgt_view):
-        # 1. Occupancy Loss: Channel 0 (Focal + Soft Dice + BCE)
-        # Forces solid interior volume infilling from hollow boundary outlines while heavily penalizing empty space false positives
-        pred_occ = pred_vox[:, 0:1]
+    def forward(self, pred_occ, pred_rgb, pred_cat, pred_view, tgt_vox, tgt_cat, tgt_view):
         tgt_occ = tgt_vox[:, 0:1]
+        tgt_rgb = tgt_vox[:, 1:4]
 
+        # 1. Occupancy Loss: Focal + Soft Dice + BCE
         eps = 1e-7
         p_clamped = pred_occ.clamp(eps, 1.0 - eps)
-        # Focal terms: alpha=0.75 for positive interior infilling, gamma=2.0 for hard-example focusing
         pos_focal = - 0.75 * tgt_occ * ((1.0 - p_clamped) ** 2) * torch.log(p_clamped)
         neg_focal = - 0.25 * (1.0 - tgt_occ) * (p_clamped ** 2) * torch.log(1.0 - p_clamped)
         focal_loss = (pos_focal + neg_focal).mean()
@@ -158,19 +170,22 @@ class MultiTaskVoxelLoss(nn.Module):
         bce_loss = self.bce(pred_occ, tgt_occ)
         occ_loss = focal_loss + bce_loss + 2.5 * dice_loss
 
-        # 2. Color Loss: Channels 1..3 (Masked MSE only on solid voxels)
-        pred_rgb = pred_vox[:, 1:4]
-        tgt_rgb = tgt_vox[:, 1:4]
+        # 2. Color Loss: Masked MSE only on solid voxels
         mask = (tgt_occ > 0.5).expand_as(pred_rgb)
-
         if mask.sum() > 0:
             rgb_loss = ((pred_rgb - tgt_rgb) ** 2 * mask.float()).sum() / (mask.sum().float() + 1e-6)
         else:
-            rgb_loss = torch.tensor(0.0, device=pred_vox.device)
+            rgb_loss = torch.tensor(0.0, device=pred_occ.device)
 
         # 3. Category & View Cross-Entropy Losses
         cat_loss = self.ce_cat(pred_cat, tgt_cat)
-        view_loss = self.ce_view(pred_view, tgt_view)
+
+        # Only penalize view error on canonical objects (ignore for OOD random scribbles)
+        canonical_mask = (tgt_cat != 11)
+        if canonical_mask.sum() > 0:
+            view_loss = self.ce_view(pred_view[canonical_mask], tgt_view[canonical_mask])
+        else:
+            view_loss = torch.tensor(0.0, device=pred_occ.device)
 
         total_loss = occ_loss + 0.5 * rgb_loss + 0.3 * cat_loss + 0.3 * view_loss
         return total_loss, occ_loss, rgb_loss, cat_loss, view_loss
@@ -186,13 +201,13 @@ class TriViewDataset(Dataset):
         self.targets_voxels = torch.from_numpy(data['targets_voxels'])
         self.categories = torch.from_numpy(data['categories']).long()
         self.views = torch.from_numpy(data['views']).long()
-        print(f"[Dataset] Loaded {len(self.inputs)} tri-view samples from {npz_path} (inputs dtype: {self.inputs.dtype}, targets dtype: {self.targets_voxels.dtype})")
+        print(f"[Dataset] Loaded {len(self.inputs)} tri-view samples from {npz_path} (inputs shape: {self.inputs.shape}, dtype: {self.inputs.dtype})")
 
     def __len__(self):
         return len(self.inputs)
 
     def __getitem__(self, idx):
-        # Normalize input sketch to [0.0, 1.0]
+        # Normalize 2-channel input sketch to [0.0, 1.0]
         if self.inputs.dtype == torch.uint8:
             inp = self.inputs[idx].float() / 255.0
         else:
@@ -213,7 +228,7 @@ class TriViewDataset(Dataset):
             self.views[idx]
         )
 
-def compute_latent_centroids(model, dataloader, device, num_classes=3):
+def compute_latent_centroids(model, dataloader, device, num_classes=12):
     """Computes class centroids and radii in latent space z for OOD rejection & snapping."""
     model.eval()
     centroids = {k: [] for k in range(num_classes)}
@@ -221,7 +236,7 @@ def compute_latent_centroids(model, dataloader, device, num_classes=3):
     with torch.no_grad():
         for x, _, cat, _ in dataloader:
             x = x.to(device)
-            _, _, _, z = model(x)
+            _, _, _, _, z = model(x)
             z_cpu = z.cpu().numpy()
             cat_cpu = cat.numpy()
             for b in range(len(cat_cpu)):
@@ -230,12 +245,14 @@ def compute_latent_centroids(model, dataloader, device, num_classes=3):
 
     centroid_data = {}
     for c_id in range(num_classes):
+        if len(centroids[c_id]) == 0:
+            continue
         vectors = np.array(centroids[c_id])
         mean_vec = np.mean(vectors, axis=0)
         dists = np.linalg.norm(vectors - mean_vec, axis=1)
         radius_95 = float(np.percentile(dists, 95))
         centroid_data[c_id] = {
-            "name": CATEGORY_NAMES[c_id],
+            "name": CATEGORY_NAMES.get(c_id, f"Class_{c_id}"),
             "centroid": mean_vec.tolist(),
             "radius_95": radius_95,
             "mean_dist": float(np.mean(dists))
@@ -259,7 +276,7 @@ def train_multitask(dataset_path, epochs=15, batch_size=32, lr=1e-3, onnx_out="A
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
-    model = AntiGravityMultiTaskNet(latent_dim=512, num_classes=11).to(device)
+    model = AntiGravityMultiTaskNet(latent_dim=512, num_classes=12).to(device)
     criterion = MultiTaskVoxelLoss()
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
@@ -278,8 +295,8 @@ def train_multitask(dataset_path, epochs=15, batch_size=32, lr=1e-3, onnx_out="A
             b_view = b_view.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            p_vox, p_cat, p_view, _ = model(b_in)
-            loss, _, _, _, _ = criterion(p_vox, p_cat, p_view, b_vox, b_cat, b_view)
+            p_occ, p_rgb, p_cat, p_view, _ = model(b_in)
+            loss, _, _, _, _ = criterion(p_occ, p_rgb, p_cat, p_view, b_vox, b_cat, b_view)
             loss.backward()
             optimizer.step()
 
@@ -295,6 +312,7 @@ def train_multitask(dataset_path, epochs=15, batch_size=32, lr=1e-3, onnx_out="A
         val_cat_correct = 0
         val_view_correct = 0
         total_val_samples = 0
+        canonical_val_samples = 0
 
         with torch.no_grad():
             for v_in, v_vox, v_cat, v_view in val_loader:
@@ -303,20 +321,24 @@ def train_multitask(dataset_path, epochs=15, batch_size=32, lr=1e-3, onnx_out="A
                 v_cat = v_cat.to(device, non_blocking=True)
                 v_view = v_view.to(device, non_blocking=True)
 
-                p_vox, p_cat, p_view, _ = model(v_in)
-                loss, _, _, _, _ = criterion(p_vox, p_cat, p_view, v_vox, v_cat, v_view)
+                p_occ, p_rgb, p_cat, p_view, _ = model(v_in)
+                loss, _, _, _, _ = criterion(p_occ, p_rgb, p_cat, p_view, v_vox, v_cat, v_view)
                 val_loss += loss.item() * v_in.size(0)
 
                 # Accuracies
                 val_cat_correct += (p_cat.argmax(dim=1) == v_cat).sum().item()
-                val_view_correct += (p_view.argmax(dim=1) == v_view).sum().item()
+
+                can_mask = (v_cat != 11)
+                if can_mask.sum() > 0:
+                    val_view_correct += (p_view[can_mask].argmax(dim=1) == v_view[can_mask]).sum().item()
+                    canonical_val_samples += can_mask.sum().item()
 
                 # Voxel IoU on occupancy channel
-                p_occ = (p_vox[:, 0] > 0.5).float()
-                t_occ = (v_vox[:, 0] > 0.5).float()
+                p_bin = (p_occ[:, 0] > 0.5).float()
+                t_bin = (v_vox[:, 0] > 0.5).float()
                 for b in range(v_in.size(0)):
-                    inter = (p_occ[b] * t_occ[b]).sum().item()
-                    union = ((p_occ[b] + t_occ[b]) > 0.5).float().sum().item()
+                    inter = (p_bin[b] * t_bin[b]).sum().item()
+                    union = ((p_bin[b] + t_bin[b]) > 0.5).float().sum().item()
                     val_iou_sum += inter / union if union > 0 else 1.0
 
                 total_val_samples += v_in.size(0)
@@ -324,7 +346,7 @@ def train_multitask(dataset_path, epochs=15, batch_size=32, lr=1e-3, onnx_out="A
         mean_val_loss = val_loss / total_val_samples
         mean_val_iou = val_iou_sum / total_val_samples
         cat_acc = val_cat_correct / total_val_samples
-        view_acc = val_view_correct / total_val_samples
+        view_acc = val_view_correct / max(canonical_val_samples, 1)
 
         print(f"Epoch [{epoch:02d}/{epochs:02d}] - Loss: {train_loss:.4f} (Val: {mean_val_loss:.4f}) | "
               f"Voxel IoU: {mean_val_iou*100:.1f}% | "
@@ -343,7 +365,7 @@ def train_multitask(dataset_path, epochs=15, batch_size=32, lr=1e-3, onnx_out="A
     print(f"\n[Train Multi-Task] Training complete! Best Voxel IoU: {best_iou*100:.2f}%")
 
     # Compute Latent Centroids for OOD Rejection & Snapping
-    centroids = compute_latent_centroids(model, val_loader, "cpu", num_classes=11)
+    centroids = compute_latent_centroids(model, val_loader, "cpu", num_classes=12)
     centroid_json_path = onnx_out.replace(".onnx", "_centroids.json")
     with open(centroid_json_path, "w") as f:
         json.dump(centroids, f, indent=2)
@@ -355,7 +377,7 @@ def train_multitask(dataset_path, epochs=15, batch_size=32, lr=1e-3, onnx_out="A
 def export_multitask_onnx(model, onnx_out):
     print(f"[ONNX Export] Exporting multi-task model to {onnx_out} for Unity Sentis...")
     model.eval().to("cpu")
-    dummy_input = torch.randn(1, 1, 64, 64, device="cpu")
+    dummy_input = torch.randn(1, 2, 64, 64, device="cpu")
 
     os.makedirs(os.path.dirname(os.path.abspath(onnx_out)), exist_ok=True)
 
@@ -366,8 +388,8 @@ def export_multitask_onnx(model, onnx_out):
         export_params=True,
         opset_version=14,
         do_constant_folding=True,
-        input_names=['input_sketch'],
-        output_names=['output_voxels_4ch', 'category_logits', 'view_logits', 'latent_z'],
+        input_names=['input_sketch_2ch'],
+        output_names=['voxel_occupancy', 'voxel_rgb', 'category_logits', 'view_logits', 'latent_z'],
         dynamo=False
     )
 
@@ -381,8 +403,8 @@ def export_multitask_onnx(model, onnx_out):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, default="Tools/DataGen/dataset_triview_test.npz")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--data", type=str, default="Tools/DataGen/dataset_triview_64.npz")
+    parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--out", type=str, default="Assets/ML/Models/draw2voxel_multitask.onnx")

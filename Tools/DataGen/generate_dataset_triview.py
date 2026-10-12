@@ -467,47 +467,143 @@ def render_multimodal_sketch(clean_proj):
     return stroke
 
 # ==============================================================================
+# 2-CHANNEL DISTANCE-FIELD PREPROCESSING & OOD GENERATION
+# ==============================================================================
+
+def preprocess_sketch_2ch(raw_img, target_box=52, canvas_dim=64, d_max=16.0):
+    """
+    Transforms raw player sketch into a 2-channel normalized representation:
+    - Channel 0 (Normalized Stroke Mask): Tight AABB crop rescaled to fit within 52x52
+      with aspect ratio preserved, centered inside 64x64 grid.
+    - Channel 1 (Truncated Distance Transform / SDF): Euclidean Distance Transform
+      (0.0 at stroke lines, increasing outward to 1.0, truncated at d_max).
+    """
+    active_y, active_x = np.where(raw_img > 0.25)
+    if len(active_x) == 0:
+        ch0 = np.zeros((canvas_dim, canvas_dim), dtype=np.float32)
+        ch1 = np.ones((canvas_dim, canvas_dim), dtype=np.float32)
+        return ch0, ch1
+
+    min_x, max_x = int(np.min(active_x)), int(np.max(active_x))
+    min_y, max_y = int(np.min(active_y)), int(np.max(active_y))
+
+    w = max_x - min_x + 1
+    h = max_y - min_y + 1
+
+    crop = raw_img[min_y:max_y+1, min_x:max_x+1]
+
+    # Aspect-preserving scale into target_box x target_box
+    scale = float(target_box) / max(w, h)
+    new_w = max(1, min(target_box, int(round(w * scale))))
+    new_h = max(1, min(target_box, int(round(h * scale))))
+
+    resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    resized = np.clip(resized, 0.0, 1.0)
+
+    # Center inside canvas_dim x canvas_dim
+    ch0 = np.zeros((canvas_dim, canvas_dim), dtype=np.float32)
+    ox = (canvas_dim - new_w) // 2
+    oy = (canvas_dim - new_h) // 2
+    ch0[oy:oy+new_h, ox:ox+new_w] = (resized > 0.2).astype(np.float32)
+
+    # Channel 1: Truncated Euclidean Distance Field (0.0 on stroke, 1.0 far away)
+    dist = ndimage.distance_transform_edt(ch0 == 0)
+    ch1 = np.clip(dist / d_max, 0.0, 1.0).astype(np.float32)
+
+    return ch0, ch1
+
+def generate_random_scribble(canvas_dim=64):
+    """Generates synthetic unclassifiable scribble / noise strokes for OOD rejection."""
+    img = np.zeros((canvas_dim, canvas_dim), dtype=np.float32)
+    scribble_type = random.choice(['random_walk', 'spiral', 'zigzags', 'splatters'])
+
+    if scribble_type == 'random_walk':
+        pts = [np.array([random.randint(15, 48), random.randint(15, 48)])]
+        for _ in range(random.randint(10, 30)):
+            step = np.random.randn(2) * random.uniform(3, 8)
+            next_pt = np.clip(pts[-1] + step, 4, canvas_dim - 5)
+            pts.append(next_pt)
+        for j in range(len(pts) - 1):
+            p1 = tuple(pts[j].astype(int))
+            p2 = tuple(pts[j+1].astype(int))
+            cv2.line(img, p1, p2, 1.0, thickness=random.choice([1, 2]))
+    elif scribble_type == 'spiral':
+        theta = np.linspace(0, random.uniform(3, 8) * np.pi, 50)
+        r = np.linspace(2, random.uniform(15, 25), 50)
+        cx, cy = random.randint(25, 39), random.randint(25, 39)
+        xs = np.clip((cx + r * np.cos(theta)).astype(int), 0, canvas_dim - 1)
+        ys = np.clip((cy + r * np.sin(theta)).astype(int), 0, canvas_dim - 1)
+        for j in range(len(xs) - 1):
+            cv2.line(img, (xs[j], ys[j]), (xs[j+1], ys[j+1]), 1.0, thickness=1)
+    else:
+        for _ in range(random.randint(2, 6)):
+            p1 = (random.randint(10, canvas_dim - 10), random.randint(10, canvas_dim - 10))
+            p2 = (random.randint(10, canvas_dim - 10), random.randint(10, canvas_dim - 10))
+            cv2.line(img, p1, p2, 1.0, thickness=random.choice([1, 2]))
+
+    return img
+
+# ==============================================================================
 # PIPELINE EXECUTION
 # ==============================================================================
 
 def generate_triview_dataset(num_samples=3300, output_path="Tools/DataGen/dataset_triview_64.npz"):
-    print(f"[DataGen Tri-View] Generating {num_samples} multi-task samples across {len(TARGET_ASSET_GENERATORS)} classes (uint8 packed)...")
-    print(f"  Target Shape: (4, 64, 64, 64) | Input: (1, 64, 64)")
-    print(f"  Categories: 11 Classes (Weapons, Toys, Electronics)")
-    print(f"  Views: 0 (Front XY), 1 (Side ZY), 2 (Top XZ)")
+    num_classes = len(TARGET_ASSET_GENERATORS)
+    ood_class_id = 11
+    num_ood = max(int(0.09 * num_samples), 1) # ~9% OOD samples
+    num_canonical = num_samples - num_ood
 
-    inputs = np.zeros((num_samples, 1, IMAGE_DIM, IMAGE_DIM), dtype=np.uint8)
+    print(f"[DataGen Tri-View] Generating {num_samples} 2-channel multi-task samples:")
+    print(f"  Canonical Samples: {num_canonical} across {num_classes} classes (Weapons, Toys, Electronics)")
+    print(f"  OOD Scribble Samples: {num_ood} (Class {ood_class_id}: OOD_Reject)")
+    print(f"  Input Shape: (2, 64, 64) [Ch0: Stroke Mask, Ch1: SDF]")
+    print(f"  Target Shape: (4, 64, 64, 64) [Ch0: Occupancy, Ch1..3: RGB]")
+
+    inputs = np.zeros((num_samples, 2, IMAGE_DIM, IMAGE_DIM), dtype=np.uint8)
     targets_voxels = np.zeros((num_samples, 4, VOXEL_DIM, VOXEL_DIM, VOXEL_DIM), dtype=np.uint8)
     categories = np.zeros(num_samples, dtype=np.int64)
     views = np.zeros(num_samples, dtype=np.int64)
 
-    num_classes = len(TARGET_ASSET_GENERATORS)
-
-    for i in range(num_samples):
-        # Balanced category and view selection
+    # 1. Canonical Asset Projections
+    for i in range(num_canonical):
         gen_fn, cat_id = TARGET_ASSET_GENERATORS[i % num_classes]
         voxel_4ch = gen_fn()
 
-        # Cycle through Front, Side, Top views
+        # Cycle through Front (0), Side (1), Top (2) views
         view_id = (i // num_classes) % 3
 
         clean_proj = project_canonical_view(voxel_4ch, view_id)
         noisy_sketch = render_multimodal_sketch(clean_proj)
 
-        inputs[i, 0] = (noisy_sketch * 255.0).astype(np.uint8)
-        
-        # Channel 0: Occupancy (0 or 1)
+        # 2-Channel Preprocessing: AABB 52x52 box centering + Truncated EDT
+        ch0, ch1 = preprocess_sketch_2ch(noisy_sketch, target_box=52, canvas_dim=IMAGE_DIM, d_max=16.0)
+
+        inputs[i, 0] = (ch0 * 255.0).astype(np.uint8)
+        inputs[i, 1] = (ch1 * 255.0).astype(np.uint8)
+
+        # Target Voxels: Channel 0 Occupancy (0 or 1), Channels 1..3 RGB (0..255)
         targets_voxels[i, 0] = (voxel_4ch[0] > 0.5).astype(np.uint8)
-        # Channels 1..3: RGB (0..255)
         targets_voxels[i, 1:4] = np.clip(voxel_4ch[1:4] * 255.0, 0, 255).astype(np.uint8)
-        
+
         categories[i] = cat_id
         views[i] = view_id
 
-        if (i + 1) % 500 == 0 or (i + 1) == num_samples:
-            print(f"  Processed {i + 1}/{num_samples} samples...")
+        if (i + 1) % 500 == 0:
+            print(f"  Processed {i + 1}/{num_canonical} canonical samples...")
 
-    print(f"[DataGen Tri-View] Saving compressed dataset to {output_path}...")
+    # 2. Synthetic OOD Scribble Samples (Class 11)
+    for k in range(num_ood):
+        idx = num_canonical + k
+        scribble = generate_random_scribble(canvas_dim=IMAGE_DIM)
+        ch0, ch1 = preprocess_sketch_2ch(scribble, target_box=52, canvas_dim=IMAGE_DIM, d_max=16.0)
+
+        inputs[idx, 0] = (ch0 * 255.0).astype(np.uint8)
+        inputs[idx, 1] = (ch1 * 255.0).astype(np.uint8)
+        # targets_voxels[idx] remains all zeros (empty mesh)
+        categories[idx] = ood_class_id
+        views[idx] = random.randint(0, 2)
+
+    print(f"[DataGen Tri-View] Finished generating {num_samples} samples. Saving compressed NPZ to {output_path}...")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     np.savez_compressed(
         output_path,
@@ -517,12 +613,13 @@ def generate_triview_dataset(num_samples=3300, output_path="Tools/DataGen/datase
         views=views
     )
     file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"[DataGen Tri-View] Generated {num_samples} multi-task samples! Size: {file_size_mb:.2f} MB")
+    print(f"[DataGen Tri-View] Saved dataset! File size: {file_size_mb:.2f} MB")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Tri-View 64^3 Multi-Task Voxel Dataset Generator")
-    parser.add_argument("--samples", type=int, default=2700, help="Number of samples to generate")
+    parser.add_argument("--samples", type=int, default=3300, help="Number of samples to generate")
     parser.add_argument("--out", type=str, default="Tools/DataGen/dataset_triview_64.npz", help="Output path")
     args = parser.parse_args()
 
     generate_triview_dataset(num_samples=args.samples, output_path=args.out)
+

@@ -303,16 +303,22 @@ namespace VRDraw2Voxel.Tests
         }
 
         /// <summary>
-        /// Downsamples current canvas to 64x64 float buffer and dispatches to Sentis.
+        /// Transforms canvas into normalized 2-channel representation [Channel 0: Stroke, Channel 1: SDF],
+        /// displays instant holographic wireframe extrusion preview, and dispatches to Sentis.
         /// </summary>
         public void Generate3DVoxels()
         {
-            float[] inputBuffer = DownsampleTo64x64();
+            float[] strokeMask;
+            float aspectRatio, fillDensity;
+            float[] inputBuffer2Ch = PreprocessToTwoChannel64x64(out strokeMask, out aspectRatio, out fillDensity);
+
+            // Instant holographic wireframe preview (<0.5ms Burst mesh generation)
+            ShowHolographicWireframePreview(strokeMask);
 
             if (multiTaskEngine != null)
             {
                 _statusMessage = "Inferring Tri-View Multi-Task 3D Voxels...";
-                multiTaskEngine.PredictMultiTaskAsync(inputBuffer, (result) =>
+                multiTaskEngine.PredictMultiTaskAsync(inputBuffer2Ch, (result) =>
                 {
                     _lastInferenceTimeMs = result.latencyMs;
                     _detectedCategory = result.category;
@@ -336,6 +342,12 @@ namespace VRDraw2Voxel.Tests
                     {
                         _lastCategoryName = _detectedCategory.ToString().ToUpper();
                         _statusMessage = $"Reconstructed {_detectedCategory} ({_categoryConfidence * 100f:F0}%) | View: {_detectedView} ({_viewConfidence * 100f:F0}%) | Voxels: {count} | {result.latencyMs:F1}ms";
+
+                        // Swap holographic preview to final colored voxel mesh
+                        if (coloredVoxelMesher != null)
+                        {
+                            coloredVoxelMesher.GenerateFromInferenceResult(result);
+                        }
                     }
 
                     if (coloredVoxelMesher == null && voxelMesher != null)
@@ -354,7 +366,7 @@ namespace VRDraw2Voxel.Tests
 
             _statusMessage = "Inferring 3D Voxel Mesh...";
             float startTime = Time.realtimeSinceStartup;
-            voxelEngine.PredictVoxelsAsync(inputBuffer, (voxels) =>
+            voxelEngine.PredictVoxelsAsync(strokeMask, (voxels) =>
             {
                 _lastInferenceTimeMs = (Time.realtimeSinceStartup - startTime) * 1000f;
                 int count = 0;
@@ -372,24 +384,159 @@ namespace VRDraw2Voxel.Tests
             });
         }
 
-        private float[] DownsampleTo64x64()
+        /// <summary>
+        /// Transforms current drawing into a 2-channel normalized representation:
+        /// - Channel 0: Tight AABB crop rescaled to fit within 52x52 box preserving aspect ratio, centered in 64x64.
+        /// - Channel 1: Normalized Truncated Euclidean Distance Field (0.0 on stroke, 1.0 at distance >= 16px).
+        /// </summary>
+        private float[] PreprocessToTwoChannel64x64(out float[] strokeMask64, out float aspectRatio, out float fillDensity)
         {
-            float[] buffer = new float[ModelResolution * ModelResolution];
-            float step = (float)canvasSize / ModelResolution;
+            strokeMask64 = new float[ModelResolution * ModelResolution];
+            float[] buffer2Ch = new float[2 * ModelResolution * ModelResolution];
 
-            for (int y64 = 0; y64 < ModelResolution; y64++)
+            int minX = canvasSize, maxX = -1, minY = canvasSize, maxY = -1;
+            int activeCount = 0;
+
+            for (int y = 0; y < canvasSize; y++)
             {
-                for (int x64 = 0; x64 < ModelResolution; x64++)
+                for (int x = 0; x < canvasSize; x++)
                 {
-                    int srcX = Mathf.Clamp((int)(x64 * step), 0, canvasSize - 1);
-                    int srcY = Mathf.Clamp((int)(y64 * step), 0, canvasSize - 1);
-
-                    Color32 c = _texturePixels[srcY * canvasSize + srcX];
-                    // Normalize brightness: white pixels = 1.0, black = 0.0
-                    buffer[x64 * ModelResolution + y64] = c.r > 100 ? 1.0f : 0.0f;
+                    if (_texturePixels[y * canvasSize + x].r > 100)
+                    {
+                        activeCount++;
+                        if (x < minX) minX = x;
+                        if (x > maxX) maxX = x;
+                        if (y < minY) minY = y;
+                        if (y > maxY) maxY = y;
+                    }
                 }
             }
-            return buffer;
+
+            if (activeCount == 0)
+            {
+                aspectRatio = 1.0f;
+                fillDensity = 0.0f;
+                for (int i = 0; i < ModelResolution * ModelResolution; i++)
+                {
+                    buffer2Ch[ModelResolution * ModelResolution + i] = 1.0f;
+                }
+                return buffer2Ch;
+            }
+
+            int w = maxX - minX + 1;
+            int h = maxY - minY + 1;
+            aspectRatio = (float)w / (float)h;
+            fillDensity = (float)activeCount / (float)(w * h);
+
+            int targetBox = 52;
+            float scale = (float)targetBox / Mathf.Max(w, h);
+            int newW = Mathf.Clamp(Mathf.RoundToInt(w * scale), 1, targetBox);
+            int newH = Mathf.Clamp(Mathf.RoundToInt(h * scale), 1, targetBox);
+
+            int ox = (ModelResolution - newW) / 2;
+            int oy = (ModelResolution - newH) / 2;
+
+            for (int dx = 0; dx < newW; dx++)
+            {
+                for (int dy = 0; dy < newH; dy++)
+                {
+                    int srcX = minX + Mathf.Clamp(Mathf.RoundToInt(dx * ((float)w / newW)), 0, w - 1);
+                    int srcY = minY + Mathf.Clamp(Mathf.RoundToInt(dy * ((float)h / newH)), 0, h - 1);
+
+                    Color32 c = _texturePixels[srcY * canvasSize + srcX];
+                    if (c.r > 100)
+                    {
+                        strokeMask64[(ox + dx) * ModelResolution + (oy + dy)] = 1.0f;
+                    }
+                }
+            }
+
+            // Pack Channel 0: Normalized Stroke Mask
+            System.Array.Copy(strokeMask64, 0, buffer2Ch, 0, ModelResolution * ModelResolution);
+
+            // Compute Channel 1: 2-Pass Chamfer Euclidean Distance Transform
+            float maxVal = 1e6f;
+            float[] dist = new float[ModelResolution * ModelResolution];
+            for (int i = 0; i < dist.Length; i++)
+            {
+                dist[i] = strokeMask64[i] > 0.5f ? 0.0f : maxVal;
+            }
+
+            float sqrt2 = 1.41421356f;
+            for (int x = 0; x < ModelResolution; x++)
+            {
+                for (int y = 0; y < ModelResolution; y++)
+                {
+                    int idx = x * ModelResolution + y;
+                    if (dist[idx] > 0f)
+                    {
+                        float best = dist[idx];
+                        if (x > 0) best = Mathf.Min(best, dist[(x - 1) * ModelResolution + y] + 1.0f);
+                        if (y > 0) best = Mathf.Min(best, dist[x * ModelResolution + (y - 1)] + 1.0f);
+                        if (x > 0 && y > 0) best = Mathf.Min(best, dist[(x - 1) * ModelResolution + (y - 1)] + sqrt2);
+                        if (x < ModelResolution - 1 && y > 0) best = Mathf.Min(best, dist[(x + 1) * ModelResolution + (y - 1)] + sqrt2);
+                        dist[idx] = best;
+                    }
+                }
+            }
+
+            for (int x = ModelResolution - 1; x >= 0; x--)
+            {
+                for (int y = ModelResolution - 1; y >= 0; y--)
+                {
+                    int idx = x * ModelResolution + y;
+                    float best = dist[idx];
+                    if (x < ModelResolution - 1) best = Mathf.Min(best, dist[(x + 1) * ModelResolution + y] + 1.0f);
+                    if (y < ModelResolution - 1) best = Mathf.Min(best, dist[x * ModelResolution + (y + 1)] + 1.0f);
+                    if (x < ModelResolution - 1 && y < ModelResolution - 1) best = Mathf.Min(best, dist[(x + 1) * ModelResolution + (y + 1)] + sqrt2);
+                    if (x > 0 && y < ModelResolution - 1) best = Mathf.Min(best, dist[(x - 1) * ModelResolution + (y + 1)] + sqrt2);
+                    dist[idx] = best;
+                }
+            }
+
+            // Normalize truncated distance field to [0.0, 1.0] (d_max = 16.0f)
+            float dMax = 16.0f;
+            int ch1Offset = ModelResolution * ModelResolution;
+            for (int i = 0; i < dist.Length; i++)
+            {
+                buffer2Ch[ch1Offset + i] = Mathf.Clamp01(dist[i] / dMax);
+            }
+
+            return buffer2Ch;
+        }
+
+        /// <summary>
+        /// Instantly renders an extruded holographic wireframe preview while neural inference runs.
+        /// </summary>
+        private void ShowHolographicWireframePreview(float[] strokeMask64)
+        {
+            if (coloredVoxelMesher == null) return;
+
+            int totalVoxels = ModelResolution * ModelResolution * ModelResolution;
+            byte[] previewOcc = new byte[totalVoxels];
+            Color32[] previewColors = new Color32[totalVoxels];
+            Color32 holoCyan = new Color32(0, 220, 255, 255);
+
+            int zStart = 28;
+            int zEnd = 36;
+
+            for (int x = 0; x < ModelResolution; x++)
+            {
+                for (int y = 0; y < ModelResolution; y++)
+                {
+                    if (strokeMask64[x * ModelResolution + y] > 0.5f)
+                    {
+                        for (int z = zStart; z < zEnd; z++)
+                        {
+                            int idx = x * (ModelResolution * ModelResolution) + y * ModelResolution + z;
+                            previewOcc[idx] = 1;
+                            previewColors[idx] = holoCyan;
+                        }
+                    }
+                }
+            }
+
+            coloredVoxelMesher.GenerateColoredMesh(previewOcc, previewColors);
         }
 
         // ==============================================================================

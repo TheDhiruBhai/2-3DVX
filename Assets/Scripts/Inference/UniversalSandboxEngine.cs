@@ -548,6 +548,11 @@ namespace VRDraw2Voxel.Inference
             return propObj;
         }
 
+        public GameObject SpawnPropFromInferenceResult(SandboxInferenceResult result, Vector3 spawnPosition)
+        {
+            return SpawnPhysicalProp(result, spawnPosition);
+        }
+
         public void ClearSpawnedProps()
         {
             foreach (var prop in _spawnedProps)

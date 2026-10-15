@@ -255,7 +255,7 @@ namespace VRDraw2Voxel.Interaction
                     : tabletopCanvas.transform.position + new Vector3(0, 0.25f, 0);
 
                 // 5. Spawn Vertex-Colored 3D Prop with Rigidbody & BoxCollider
-                GameObject prop = sandboxEngine.SpawnPropFromInferenceResult(result, spawnPos);
+                GameObject prop = sandboxEngine.SpawnPhysicalProp(result, spawnPos);
                 if (prop != null)
                 {
                     // Enforce 15-prop FIFO queue to maintain 90 FPS VR headroom

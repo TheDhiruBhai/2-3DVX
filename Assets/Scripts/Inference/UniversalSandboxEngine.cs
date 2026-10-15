@@ -5,8 +5,13 @@ using Unity.Collections;
 using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
-using Unity.Sentis;
 using VRDraw2Voxel.VoxelMesh;
+
+#if UNITY_6000_0_OR_NEWER || UNITY_INFERENCE_ENGINE
+using Unity.InferenceEngine;
+#else
+using Unity.Sentis;
+#endif
 
 namespace VRDraw2Voxel.Inference
 {
@@ -68,6 +73,8 @@ namespace VRDraw2Voxel.Inference
         [SerializeField] private int minHalfThickness = 2;
 
         [Header("Physics & Prop Spawning")]
+        [Tooltip("Enable Rigidbody and Collider on spawned sandbox props.")]
+        [SerializeField] private bool enablePhysicsOnSpawn = true;
         [Tooltip("Scale of individual voxels in meters (0.015 = 1.5cm).")]
         [SerializeField] private float voxelScale = 0.015f;
         [SerializeField] private float propMass = 1.0f;

@@ -352,11 +352,11 @@ namespace VRDraw2Voxel.Tests
             ClearCanvas(false);
             int scale = canvasSize / ModelResolution;
 
-            for (int y = 0; y < ModelResolution; y++)
+            for (int x = 0; x < ModelResolution; x++)
             {
-                for (int x = 0; x < ModelResolution; x++)
+                for (int y = 0; y < ModelResolution; y++)
                 {
-                    byte b = mask[y * ModelResolution + x];
+                    byte b = mask[x * ModelResolution + y];
                     if (b > 80)
                     {
                         FillRect(x * scale, y * scale, (x + 1) * scale, (y + 1) * scale);

@@ -1,27 +1,30 @@
+#!/usr/bin/env python3
 """
-Quick, Draw! 50-Class Sandbox Pipeline
-Downloads 50 diverse creative sandbox categories from Google Cloud Storage via HTTP Range requests,
-preprocesses them into the 2-Channel normalized [1, 2, 64, 64] format, trains the Universal Sandbox Model,
-and exports the ONNX model and semantic palette configuration for Unity.
+Quick, Draw! Universal Sandbox Dataset Pipeline & Model Trainer (AntiGravity 2-3DVX)
+=====================================================================================
+Pulls 50 diverse creative categories + 1 OOD noise class directly from Google Cloud
+using partial HTTP Range requests. Converts raw raster strokes into Unity-aligned (X, Y)
+64x64 2-Channel SDF tensors [Channel 0: Stroke, Channel 1: Distance Transform].
+Trains UniversalSandboxNet with Volumetric 2.5D Depth Head and exports ONNX for Unity Sentis.
 """
 
 import os
 import sys
-import json
 import time
-import math
+import json
+import base64
 import random
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
-import scipy.ndimage as ndimage
+from scipy import ndimage
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
 # ==============================================================================
-# 50 CURATED SANDBOX CATEGORIES & SEMANTIC PALETTES
+# 50 HIGH-CREATIVITY SANDBOX CATEGORIES + 1 OOD CLASS
 # ==============================================================================
 
 SANDBOX_CLASSES = [
@@ -32,11 +35,11 @@ SANDBOX_CLASSES = [
     {"name": "cannon", "label": "Cannon", "family": "Weapons", "color": [50, 55, 60], "accent": [180, 140, 60]},
     {"name": "knife", "label": "Dagger", "family": "Weapons", "color": [210, 215, 220], "accent": [40, 40, 45]},
     {"name": "boomerang", "label": "Boomerang", "family": "Weapons", "color": [160, 105, 60], "accent": [220, 70, 50]},
-    {"name": "hammer", "label": "War Hammer", "family": "Tools", "color": [130, 135, 140], "accent": [110, 70, 40]},
-    {"name": "screwdriver", "label": "Screwdriver", "family": "Tools", "color": [230, 190, 40], "accent": [180, 185, 190]},
-    {"name": "saw", "label": "Hand Saw", "family": "Tools", "color": [200, 205, 210], "accent": [220, 100, 40]},
-    {"name": "pliers", "label": "Pliers", "family": "Tools", "color": [210, 50, 50], "accent": [150, 155, 160]},
-    {"name": "flashlight", "label": "Flashlight", "family": "Tools", "color": [45, 50, 55], "accent": [255, 240, 100]},
+    {"name": "hammer", "label": "War Hammer", "family": "Tools", "color": [130, 135, 140], "accent": [120, 80, 45]},
+    {"name": "screwdriver", "label": "Screwdriver", "family": "Tools", "color": [220, 60, 50], "accent": [190, 195, 200]},
+    {"name": "saw", "label": "Hand Saw", "family": "Tools", "color": [170, 175, 180], "accent": [135, 80, 40]},
+    {"name": "pliers", "label": "Pliers", "family": "Tools", "color": [50, 120, 200], "accent": [180, 185, 190]},
+    {"name": "flashlight", "label": "Flashlight", "family": "Gear", "color": [45, 50, 55], "accent": [255, 230, 80]},
     {"name": "umbrella", "label": "Umbrella", "family": "Gear", "color": [60, 140, 220], "accent": [40, 40, 45]},
     {"name": "key", "label": "Golden Key", "family": "Gear", "color": [235, 195, 55], "accent": [255, 230, 120]},
     {"name": "anvil", "label": "Blacksmith Anvil", "family": "Tools", "color": [65, 70, 75], "accent": [90, 95, 100]},
@@ -122,12 +125,19 @@ def fetch_class_samples(cls_info, samples_per_class=1200):
         return None
 
 # ==============================================================================
-# 2-CHANNEL PREPROCESSING: AABB Centering (52x52) + Chamfer Euclidean SDF
+# 2-CHANNEL PREPROCESSING: Unity-Aligned (X=Col, Y=FlippedRow) + Chamfer Euclidean SDF
 # ==============================================================================
 
 def preprocess_28x28_to_2ch64(img28, target_box=52, canvas_dim=64, d_max=16.0):
-    """Upscales 28x28 QuickDraw raster to 64x64 2-Channel SDF."""
-    active_y, active_x = np.where(img28 > 40)
+    """
+    Converts 28x28 QuickDraw raster to 64x64 2-Channel SDF in Unity (X, Y) coordinate space.
+    QuickDraw: row=top, col=left
+    Unity: Dim 0 = X (left to right), Dim 1 = Y (bottom to top).
+    Transform: np.flipud(img28).T
+    """
+    img_unity = np.flipud(img28).T
+
+    active_x, active_y = np.where(img_unity > 40)
     if len(active_x) == 0:
         ch0 = np.zeros((canvas_dim, canvas_dim), dtype=np.float32)
         ch1 = np.ones((canvas_dim, canvas_dim), dtype=np.float32)
@@ -138,23 +148,23 @@ def preprocess_28x28_to_2ch64(img28, target_box=52, canvas_dim=64, d_max=16.0):
     w = max_x - min_x + 1
     h = max_y - min_y + 1
 
-    crop = img28[min_y:max_y+1, min_x:max_x+1]
+    crop = img_unity[min_x:max_x+1, min_y:max_y+1]
     scale = float(target_box) / max(w, h)
     new_w = max(1, min(target_box, int(round(w * scale))))
     new_h = max(1, min(target_box, int(round(h * scale))))
 
-    # Zoom crop
-    zoom_y = new_h / float(h)
+    # Zoom crop: zoom along X (new_w/w) and along Y (new_h/h)
     zoom_x = new_w / float(w)
-    resized = ndimage.zoom(crop.astype(np.float32), (zoom_y, zoom_x), order=1)
+    zoom_y = new_h / float(h)
+    resized = ndimage.zoom(crop.astype(np.float32), (zoom_x, zoom_y), order=1)
     resized = np.clip(resized / 255.0, 0.0, 1.0)
 
-    actual_h, actual_w = resized.shape
+    actual_w, actual_h = resized.shape
     ox = (canvas_dim - actual_w) // 2
     oy = (canvas_dim - actual_h) // 2
 
     ch0 = np.zeros((canvas_dim, canvas_dim), dtype=np.float32)
-    ch0[oy:oy+actual_h, ox:ox+actual_w] = (resized > 0.2).astype(np.float32)
+    ch0[ox:ox+actual_w, oy:oy+actual_h] = (resized > 0.2).astype(np.float32)
 
     # Chamfer Euclidean Distance Transform
     dist = ndimage.distance_transform_edt(ch0 == 0)
@@ -163,7 +173,7 @@ def preprocess_28x28_to_2ch64(img28, target_box=52, canvas_dim=64, d_max=16.0):
     return ch0, ch1
 
 def generate_random_scribble_2ch(canvas_dim=64):
-    """Generates synthetic OOD scribble for class 50."""
+    """Generates synthetic OOD scribble for class 50 in Unity (X, Y) space."""
     ch0 = np.zeros((canvas_dim, canvas_dim), dtype=np.float32)
     pts = [np.array([random.randint(15, 48), random.randint(15, 48)])]
     for _ in range(random.randint(8, 25)):
@@ -173,11 +183,10 @@ def generate_random_scribble_2ch(canvas_dim=64):
     for j in range(len(pts) - 1):
         p1 = tuple(pts[j].astype(int))
         p2 = tuple(pts[j+1].astype(int))
-        # Draw line
         length = max(1, int(np.hypot(p2[0]-p1[0], p2[1]-p1[1])))
         xs = np.linspace(p1[0], p2[0], length).astype(int)
         ys = np.linspace(p1[1], p2[1], length).astype(int)
-        ch0[ys, xs] = 1.0
+        ch0[xs, ys] = 1.0
     dist = ndimage.distance_transform_edt(ch0 == 0)
     ch1 = np.clip(dist / 16.0, 0.0, 1.0).astype(np.float32)
     return ch0, ch1
@@ -187,7 +196,7 @@ def generate_random_scribble_2ch(canvas_dim=64):
 # ==============================================================================
 
 def build_sandbox_dataset(output_path="Tools/DataGen/dataset_sandbox_50.npz", samples_per_class=1000):
-    print(f"\n[Sandbox DataGen] Downloading & preprocessing 50 QuickDraw classes ({samples_per_class} samples/class)...")
+    print(f"\n[Sandbox DataGen] Downloading & preprocessing 50 QuickDraw classes in Unity (X, Y) space ({samples_per_class} samples/class)...")
     t0 = time.time()
 
     valid_classes = [c for c in SANDBOX_CLASSES if c["name"] != "ood_scribble"]
@@ -243,7 +252,7 @@ def build_sandbox_dataset(output_path="Tools/DataGen/dataset_sandbox_50.npz", sa
 class UniversalSandboxNet(nn.Module):
     """
     Lightweight 50-Class Sandbox Recognizer + 2.5D Curvature Depth Head:
-    - Input: [1, 2, 64, 64] (Stroke + SDF)
+    - Input: [1, 2, 64, 64] (Stroke + SDF in Unity X, Y space)
     - Output:
       1. category_logits: [1, 51]
       2. latent_z: [1, 512]
@@ -285,7 +294,7 @@ class UniversalSandboxNet(nn.Module):
             nn.Linear(256, num_classes)
         )
 
-        # Volumetric 2.5D Depth Inflation Trunk (Generates continuous depth heightmap from latent code)
+        # Volumetric 2.5D Depth Inflation Trunk
         self.fc_depth = nn.Linear(latent_dim, 128 * 4 * 4)
         self.depth_decoder = nn.Sequential(
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1), # -> 8x8
@@ -320,30 +329,83 @@ class UniversalSandboxNet(nn.Module):
 # ==============================================================================
 
 class SandboxDataset(Dataset):
-    def __init__(self, npz_path):
+    def __init__(self, npz_path, augment=False):
         data = np.load(npz_path)
         self.inputs = data['inputs']
         self.categories = data['categories']
         self.length = len(self.categories)
+        self.augment = augment
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        inp = torch.from_numpy(self.inputs[idx].astype(np.float32) / 255.0)
+        ch0 = self.inputs[idx, 0].astype(np.float32) / 255.0
+        ch1 = self.inputs[idx, 1].astype(np.float32) / 255.0
         cat = torch.tensor(self.categories[idx], dtype=torch.long)
+
+        if self.augment and random.random() < 0.60:
+            angle = random.uniform(-10, 10)
+            dx = random.randint(-2, 2)
+            dy = random.randint(-2, 2)
+            ch0 = ndimage.rotate(ch0, angle, reshape=False, order=1)
+            ch0 = ndimage.shift(ch0, (dx, dy), order=1)
+            ch0 = np.clip(ch0, 0.0, 1.0)
+            dist = ndimage.distance_transform_edt(ch0 < 0.25)
+            ch1 = np.clip(dist / 16.0, 0.0, 1.0).astype(np.float32)
+
+        inp = torch.from_numpy(np.stack([ch0, ch1], axis=0).astype(np.float32))
         return inp, cat
 
-def train_sandbox_model(dataset_path="Tools/DataGen/dataset_sandbox_50.npz", epochs=10, batch_size=64, lr=1e-3):
+def train_sandbox_model(dataset_path="Tools/DataGen/dataset_sandbox_50.npz", epochs=12, batch_size=64, lr=1e-3):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("\n" + "=" * 70)
-    print("Training Universal 50-Class Sandbox Model on RTX 4050 GPU")
+    print(f"Training Universal 50-Class Sandbox Model on {device.type.upper()} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
     print("=" * 70)
 
-    dataset = SandboxDataset(dataset_path)
-    val_size = int(0.15 * len(dataset))
-    train_size = len(dataset) - val_size
-    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
+    dataset_full = np.load(dataset_path)
+    total_len = len(dataset_full['categories'])
+    val_size = int(0.15 * total_len)
+    train_size = total_len - val_size
+
+    # Split indices deterministically
+    np.random.seed(42)
+    indices = np.random.permutation(total_len)
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:]
+
+    raw_inputs = dataset_full['inputs']
+    raw_categories = dataset_full['categories']
+
+    class IndexDataset(Dataset):
+        def __init__(self, sub_indices, augment=False):
+            self.sub_indices = sub_indices
+            self.augment = augment
+
+        def __len__(self):
+            return len(self.sub_indices)
+
+        def __getitem__(self, i):
+            idx = self.sub_indices[i]
+            ch0 = raw_inputs[idx, 0].astype(np.float32) / 255.0
+            ch1 = raw_inputs[idx, 1].astype(np.float32) / 255.0
+            cat = torch.tensor(raw_categories[idx], dtype=torch.long)
+
+            if self.augment and random.random() < 0.60:
+                angle = random.uniform(-10, 10)
+                dx = random.randint(-2, 2)
+                dy = random.randint(-2, 2)
+                ch0 = ndimage.rotate(ch0, angle, reshape=False, order=1)
+                ch0 = ndimage.shift(ch0, (dx, dy), order=1)
+                ch0 = np.clip(ch0, 0.0, 1.0)
+                dist = ndimage.distance_transform_edt(ch0 < 0.25)
+                ch1 = np.clip(dist / 16.0, 0.0, 1.0).astype(np.float32)
+
+            inp = torch.from_numpy(np.stack([ch0, ch1], axis=0).astype(np.float32))
+            return inp, cat
+
+    train_set = IndexDataset(train_indices, augment=True)
+    val_set = IndexDataset(val_indices, augment=False)
 
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, drop_last=True, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, pin_memory=True)
@@ -362,9 +424,8 @@ def train_sandbox_model(dataset_path="Tools/DataGen/dataset_sandbox_50.npz", epo
             optimizer.zero_grad()
             p_logits, p_depth, _ = model(b_in)
 
-            # Target depth heightmap: smooth inflated profile bounded by stroke mask
             stroke_mask = b_in[:, 0:1]
-            target_depth = stroke_mask * 0.85 # 2.5D normalized half-thickness
+            target_depth = stroke_mask * 0.85
 
             loss_cls = criterion_cls(p_logits, b_cat)
             loss_d = criterion_depth(p_depth * stroke_mask, target_depth)
@@ -420,8 +481,74 @@ def train_sandbox_model(dataset_path="Tools/DataGen/dataset_sandbox_50.npz", epo
         json.dump(SANDBOX_CLASSES, f, indent=2)
     print(f"[Sandbox Metadata] Saved 50-class catalog to: {meta_path}")
 
+    # Export 20 Authentic Unity-Aligned Presets
+    export_sandbox_presets(model, raw_inputs, raw_categories, val_indices)
+
+def export_sandbox_presets(model, raw_inputs, raw_categories, val_indices):
+    print("\n[Sandbox Presets] Selecting and exporting 20 authentic Unity-aligned presets...")
+    target_presets = [
+        ('airplane', 'Vehicles', 'Airplane'),
+        ('car', 'Vehicles', 'Sports Car'),
+        ('bicycle', 'Vehicles', 'Bicycle'),
+        ('sailboat', 'Vehicles', 'Sailboat'),
+        ('apple', 'Food', 'Red Apple'),
+        ('pizza', 'Food', 'Pizza Slice'),
+        ('donut', 'Food', 'Glazed Donut'),
+        ('ice cream', 'Food', 'Ice Cream'),
+        ('cat', 'Animals', 'Cat Figurine'),
+        ('duck', 'Animals', 'Rubber Ducky'),
+        ('fish', 'Animals', 'Tropical Fish'),
+        ('frog', 'Animals', 'Tree Frog'),
+        ('hammer', 'Tools', 'War Hammer'),
+        ('anvil', 'Tools', 'Blacksmith Anvil'),
+        ('guitar', 'Tools', 'Acoustic Guitar'),
+        ('tree', 'Tools', 'Pine Tree'),
+        ('sword', 'Weapons', 'Excalibur Sword'),
+        ('cannon', 'Weapons', 'Siege Cannon'),
+        ('crown', 'Weapons', 'Royal Crown'),
+        ('diamond', 'Weapons', 'Magic Diamond'),
+    ]
+
+    export_list = []
+    model.eval()
+
+    with torch.no_grad():
+        for cat_name, family, label in target_presets:
+            c_idx = next(i for i, c in enumerate(SANDBOX_CLASSES) if c['name'] == cat_name)
+            candidates = [idx for idx in val_indices if raw_categories[idx] == c_idx]
+            if len(candidates) == 0:
+                candidates = [idx for idx in range(len(raw_categories)) if raw_categories[idx] == c_idx]
+
+            best_idx = candidates[0]
+            best_prob = -1.0
+
+            for idx in candidates[:200]:
+                inp = torch.from_numpy(raw_inputs[idx:idx+1].astype(np.float32) / 255.0)
+                logits, _, _ = model(inp)
+                prob = torch.softmax(logits, dim=1)[0, c_idx].item()
+                if prob > best_prob:
+                    best_prob = prob
+                    best_idx = idx
+
+            # raw_inputs[best_idx, 0] is the (64, 64) uint8 stroke mask in Unity (X, Y) space
+            raw_bytes = raw_inputs[best_idx, 0].tobytes()
+            b64_str = base64.b64encode(raw_bytes).decode('ascii')
+            export_list.append({
+                'name': cat_name,
+                'label': label,
+                'family': family,
+                'confidence': float(best_prob),
+                'data': b64_str
+            })
+            print(f"  ✔ Preset {label:<18} ({family:<10}): Best val conf = {best_prob*100:5.1f}%")
+
+    presets_path = "Assets/ML/Models/sandbox_presets.json"
+    with open(presets_path, "w") as f:
+        json.dump(export_list, f, indent=2)
+    print(f"[Sandbox Presets] Saved 20 presets to: {presets_path}")
+
 if __name__ == "__main__":
     npz_file = "Tools/DataGen/dataset_sandbox_50.npz"
-    if not os.path.exists(npz_file):
-        build_sandbox_dataset(npz_file, samples_per_class=1000)
-    train_sandbox_model(npz_file, epochs=10, batch_size=64, lr=1e-3)
+    # Always rebuild dataset to guarantee correct Unity orientation
+    build_sandbox_dataset(npz_file, samples_per_class=1000)
+    train_sandbox_model(npz_file, epochs=12, batch_size=64, lr=1e-3)

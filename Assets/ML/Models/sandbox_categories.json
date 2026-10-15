@@ -1,0 +1,767 @@
+[
+  {
+    "name": "sword",
+    "label": "Sword",
+    "family": "Weapons",
+    "color": [
+      190,
+      195,
+      205
+    ],
+    "accent": [
+      230,
+      180,
+      50
+    ]
+  },
+  {
+    "name": "axe",
+    "label": "Battleaxe",
+    "family": "Weapons",
+    "color": [
+      120,
+      130,
+      140
+    ],
+    "accent": [
+      115,
+      75,
+      45
+    ]
+  },
+  {
+    "name": "rifle",
+    "label": "Rifle",
+    "family": "Weapons",
+    "color": [
+      70,
+      75,
+      80
+    ],
+    "accent": [
+      130,
+      85,
+      50
+    ]
+  },
+  {
+    "name": "cannon",
+    "label": "Cannon",
+    "family": "Weapons",
+    "color": [
+      50,
+      55,
+      60
+    ],
+    "accent": [
+      180,
+      140,
+      60
+    ]
+  },
+  {
+    "name": "knife",
+    "label": "Dagger",
+    "family": "Weapons",
+    "color": [
+      210,
+      215,
+      220
+    ],
+    "accent": [
+      40,
+      40,
+      45
+    ]
+  },
+  {
+    "name": "boomerang",
+    "label": "Boomerang",
+    "family": "Weapons",
+    "color": [
+      160,
+      105,
+      60
+    ],
+    "accent": [
+      220,
+      70,
+      50
+    ]
+  },
+  {
+    "name": "hammer",
+    "label": "War Hammer",
+    "family": "Tools",
+    "color": [
+      130,
+      135,
+      140
+    ],
+    "accent": [
+      110,
+      70,
+      40
+    ]
+  },
+  {
+    "name": "screwdriver",
+    "label": "Screwdriver",
+    "family": "Tools",
+    "color": [
+      230,
+      190,
+      40
+    ],
+    "accent": [
+      180,
+      185,
+      190
+    ]
+  },
+  {
+    "name": "saw",
+    "label": "Hand Saw",
+    "family": "Tools",
+    "color": [
+      200,
+      205,
+      210
+    ],
+    "accent": [
+      220,
+      100,
+      40
+    ]
+  },
+  {
+    "name": "pliers",
+    "label": "Pliers",
+    "family": "Tools",
+    "color": [
+      210,
+      50,
+      50
+    ],
+    "accent": [
+      150,
+      155,
+      160
+    ]
+  },
+  {
+    "name": "flashlight",
+    "label": "Flashlight",
+    "family": "Tools",
+    "color": [
+      45,
+      50,
+      55
+    ],
+    "accent": [
+      255,
+      240,
+      100
+    ]
+  },
+  {
+    "name": "umbrella",
+    "label": "Umbrella",
+    "family": "Gear",
+    "color": [
+      60,
+      140,
+      220
+    ],
+    "accent": [
+      40,
+      40,
+      45
+    ]
+  },
+  {
+    "name": "key",
+    "label": "Golden Key",
+    "family": "Gear",
+    "color": [
+      235,
+      195,
+      55
+    ],
+    "accent": [
+      255,
+      230,
+      120
+    ]
+  },
+  {
+    "name": "anvil",
+    "label": "Blacksmith Anvil",
+    "family": "Tools",
+    "color": [
+      65,
+      70,
+      75
+    ],
+    "accent": [
+      90,
+      95,
+      100
+    ]
+  },
+  {
+    "name": "helmet",
+    "label": "Knight Helmet",
+    "family": "Armor",
+    "color": [
+      170,
+      175,
+      185
+    ],
+    "accent": [
+      200,
+      60,
+      60
+    ]
+  },
+  {
+    "name": "crown",
+    "label": "Royal Crown",
+    "family": "Armor",
+    "color": [
+      240,
+      200,
+      50
+    ],
+    "accent": [
+      220,
+      40,
+      50
+    ]
+  },
+  {
+    "name": "diamond",
+    "label": "Magic Diamond",
+    "family": "Treasure",
+    "color": [
+      90,
+      225,
+      240
+    ],
+    "accent": [
+      220,
+      250,
+      255
+    ]
+  },
+  {
+    "name": "star",
+    "label": "Shining Star",
+    "family": "Celestial",
+    "color": [
+      255,
+      225,
+      60
+    ],
+    "accent": [
+      255,
+      245,
+      160
+    ]
+  },
+  {
+    "name": "sun",
+    "label": "Radiant Sun",
+    "family": "Celestial",
+    "color": [
+      255,
+      180,
+      40
+    ],
+    "accent": [
+      255,
+      220,
+      70
+    ]
+  },
+  {
+    "name": "cloud",
+    "label": "Fluffy Cloud",
+    "family": "Celestial",
+    "color": [
+      230,
+      240,
+      250
+    ],
+    "accent": [
+      190,
+      210,
+      235
+    ]
+  },
+  {
+    "name": "mountain",
+    "label": "Snowy Mountain",
+    "family": "Nature",
+    "color": [
+      110,
+      115,
+      125
+    ],
+    "accent": [
+      245,
+      250,
+      255
+    ]
+  },
+  {
+    "name": "airplane",
+    "label": "Airplane",
+    "family": "Vehicles",
+    "color": [
+      235,
+      240,
+      245
+    ],
+    "accent": [
+      50,
+      120,
+      210
+    ]
+  },
+  {
+    "name": "helicopter",
+    "label": "Helicopter",
+    "family": "Vehicles",
+    "color": [
+      75,
+      110,
+      65
+    ],
+    "accent": [
+      40,
+      40,
+      40
+    ]
+  },
+  {
+    "name": "car",
+    "label": "Sports Car",
+    "family": "Vehicles",
+    "color": [
+      225,
+      50,
+      50
+    ],
+    "accent": [
+      40,
+      40,
+      45
+    ]
+  },
+  {
+    "name": "bicycle",
+    "label": "Bicycle",
+    "family": "Vehicles",
+    "color": [
+      50,
+      195,
+      200
+    ],
+    "accent": [
+      30,
+      30,
+      35
+    ]
+  },
+  {
+    "name": "sailboat",
+    "label": "Sailboat",
+    "family": "Vehicles",
+    "color": [
+      245,
+      245,
+      250
+    ],
+    "accent": [
+      140,
+      85,
+      45
+    ]
+  },
+  {
+    "name": "skateboard",
+    "label": "Skateboard",
+    "family": "Vehicles",
+    "color": [
+      180,
+      120,
+      60
+    ],
+    "accent": [
+      80,
+      220,
+      100
+    ]
+  },
+  {
+    "name": "duck",
+    "label": "Rubber Ducky",
+    "family": "Creatures",
+    "color": [
+      245,
+      215,
+      45
+    ],
+    "accent": [
+      240,
+      120,
+      35
+    ]
+  },
+  {
+    "name": "cat",
+    "label": "Cat Figurine",
+    "family": "Creatures",
+    "color": [
+      230,
+      140,
+      65
+    ],
+    "accent": [
+      245,
+      185,
+      195
+    ]
+  },
+  {
+    "name": "dog",
+    "label": "Dog Figurine",
+    "family": "Creatures",
+    "color": [
+      175,
+      125,
+      75
+    ],
+    "accent": [
+      50,
+      50,
+      55
+    ]
+  },
+  {
+    "name": "bear",
+    "label": "Grizzly Bear",
+    "family": "Creatures",
+    "color": [
+      105,
+      70,
+      45
+    ],
+    "accent": [
+      60,
+      40,
+      25
+    ]
+  },
+  {
+    "name": "fish",
+    "label": "Tropical Fish",
+    "family": "Creatures",
+    "color": [
+      60,
+      185,
+      210
+    ],
+    "accent": [
+      245,
+      130,
+      50
+    ]
+  },
+  {
+    "name": "bird",
+    "label": "Songbird",
+    "family": "Creatures",
+    "color": [
+      225,
+      65,
+      65
+    ],
+    "accent": [
+      245,
+      185,
+      45
+    ]
+  },
+  {
+    "name": "frog",
+    "label": "Tree Frog",
+    "family": "Creatures",
+    "color": [
+      80,
+      185,
+      70
+    ],
+    "accent": [
+      230,
+      200,
+      40
+    ]
+  },
+  {
+    "name": "apple",
+    "label": "Red Apple",
+    "family": "Food",
+    "color": [
+      215,
+      45,
+      45
+    ],
+    "accent": [
+      85,
+      150,
+      50
+    ]
+  },
+  {
+    "name": "banana",
+    "label": "Yellow Banana",
+    "family": "Food",
+    "color": [
+      245,
+      225,
+      55
+    ],
+    "accent": [
+      130,
+      110,
+      40
+    ]
+  },
+  {
+    "name": "pizza",
+    "label": "Pizza Slice",
+    "family": "Food",
+    "color": [
+      240,
+      185,
+      65
+    ],
+    "accent": [
+      200,
+      45,
+      45
+    ]
+  },
+  {
+    "name": "donut",
+    "label": "Glazed Donut",
+    "family": "Food",
+    "color": [
+      230,
+      120,
+      160
+    ],
+    "accent": [
+      245,
+      235,
+      100
+    ]
+  },
+  {
+    "name": "ice cream",
+    "label": "Ice Cream Cone",
+    "family": "Food",
+    "color": [
+      110,
+      220,
+      175
+    ],
+    "accent": [
+      190,
+      130,
+      70
+    ]
+  },
+  {
+    "name": "hamburger",
+    "label": "Burger",
+    "family": "Food",
+    "color": [
+      215,
+      160,
+      85
+    ],
+    "accent": [
+      120,
+      65,
+      35
+    ]
+  },
+  {
+    "name": "tree",
+    "label": "Pine Tree",
+    "family": "Nature",
+    "color": [
+      55,
+      145,
+      65
+    ],
+    "accent": [
+      115,
+      75,
+      45
+    ]
+  },
+  {
+    "name": "flower",
+    "label": "Garden Flower",
+    "family": "Nature",
+    "color": [
+      235,
+      75,
+      120
+    ],
+    "accent": [
+      245,
+      210,
+      55
+    ]
+  },
+  {
+    "name": "cactus",
+    "label": "Desert Cactus",
+    "family": "Nature",
+    "color": [
+      75,
+      155,
+      80
+    ],
+    "accent": [
+      220,
+      65,
+      95
+    ]
+  },
+  {
+    "name": "mushroom",
+    "label": "Magic Mushroom",
+    "family": "Nature",
+    "color": [
+      220,
+      50,
+      50
+    ],
+    "accent": [
+      245,
+      245,
+      245
+    ]
+  },
+  {
+    "name": "campfire",
+    "label": "Campfire",
+    "family": "Nature",
+    "color": [
+      245,
+      120,
+      35
+    ],
+    "accent": [
+      105,
+      65,
+      40
+    ]
+  },
+  {
+    "name": "television",
+    "label": "Retro TV",
+    "family": "Tech",
+    "color": [
+      125,
+      85,
+      55
+    ],
+    "accent": [
+      50,
+      55,
+      65
+    ]
+  },
+  {
+    "name": "radio",
+    "label": "Boombox Radio",
+    "family": "Tech",
+    "color": [
+      160,
+      165,
+      170
+    ],
+    "accent": [
+      45,
+      45,
+      50
+    ]
+  },
+  {
+    "name": "guitar",
+    "label": "Acoustic Guitar",
+    "family": "Tech",
+    "color": [
+      200,
+      125,
+      60
+    ],
+    "accent": [
+      200,
+      205,
+      210
+    ]
+  },
+  {
+    "name": "chair",
+    "label": "Wooden Chair",
+    "family": "Furniture",
+    "color": [
+      155,
+      105,
+      55
+    ],
+    "accent": [
+      115,
+      75,
+      40
+    ]
+  },
+  {
+    "name": "clock",
+    "label": "Wall Clock",
+    "family": "Tech",
+    "color": [
+      240,
+      240,
+      245
+    ],
+    "accent": [
+      200,
+      160,
+      50
+    ]
+  },
+  {
+    "name": "ood_scribble",
+    "label": "Scribble / Noise",
+    "family": "OOD",
+    "color": [
+      150,
+      150,
+      150
+    ],
+    "accent": [
+      80,
+      80,
+      80
+    ]
+  }
+]

@@ -14,9 +14,17 @@ namespace VRDraw2Voxel.Tests
     /// and Electronics (gadgets & retro tech) with continuous 360° PS2 trophy achievement display,
     /// real-time stroke feasibility feedback, and a player capability disclaimer guide.
     /// </summary>
+    public enum GamePlayMode
+    {
+        Sandbox50Class = 0,
+        Studio12Class = 1
+    }
+
     public class MousePaintCanvas : MonoBehaviour
     {
         [Header("Engine References")]
+        [SerializeField] private GamePlayMode activeMode = GamePlayMode.Sandbox50Class;
+        [SerializeField] private UniversalSandboxEngine sandboxEngine;
         [SerializeField] private SentisMultiTaskEngine multiTaskEngine;
         [SerializeField] private ColoredVoxelMesher coloredVoxelMesher;
         [SerializeField] private SentisVoxelEngine voxelEngine;
@@ -42,8 +50,8 @@ namespace VRDraw2Voxel.Tests
         private float _lastInferenceTimeMs = 0f;
         private int _lastSolidVoxelCount = 0;
         private string _statusMessage = "Draw with mouse or pick a preset!";
-        private string _lastGeneratedItemName = "Legendary Buster Sword";
-        private string _lastCategoryName = "WEAPONS";
+        private string _lastGeneratedItemName = "Airplane";
+        private string _lastCategoryName = "VEHICLES";
 
         // Multi-Task Tri-View State
         private ReconstructedCategory _detectedCategory = ReconstructedCategory.Unknown;
@@ -52,16 +60,30 @@ namespace VRDraw2Voxel.Tests
         private float _viewConfidence = 0f;
         private bool _isOutOfDistribution = false;
 
+        // Sandbox Mode State
+        private SandboxInferenceResult _lastSandboxResult;
+        private int _selectedSandboxTab = 0; // 0: Vehicles, 1: Food, 2: Animals, 3: Tools, 4: Weapons
+
         // Multi-Category Tabs & Disclaimer Guide State
         private int _selectedCategoryTab = 0; // 0: Weapons, 1: Toys, 2: Electronics
         private bool _showDisclaimerModal = false;
 
         public const int ModelResolution = 64;
-        private Rect _canvasRect = new Rect(20, 65, 256, 256);
+        private Rect _canvasRect = new Rect(20, 68, 256, 256);
 
         private void Awake()
         {
             InitializeTexture();
+
+            if (sandboxEngine == null)
+            {
+                sandboxEngine = FindFirstObjectByType<UniversalSandboxEngine>();
+                if (sandboxEngine == null)
+                {
+                    sandboxEngine = gameObject.AddComponent<UniversalSandboxEngine>();
+                    Debug.Log("[MousePaintCanvas] Auto-attached UniversalSandboxEngine to GameObject.");
+                }
+            }
 
             if (multiTaskEngine == null)
             {
@@ -97,7 +119,14 @@ namespace VRDraw2Voxel.Tests
         {
             // Give one frame for all inference engines to awaken cleanly
             yield return null;
-            LoadPreset("Sword");
+            if (activeMode == GamePlayMode.Sandbox50Class)
+            {
+                LoadQuickDrawPreset("Airplane");
+            }
+            else
+            {
+                LoadPreset("Sword");
+            }
         }
 
         private void InitializeTexture()
@@ -307,6 +336,40 @@ namespace VRDraw2Voxel.Tests
         }
 
         /// <summary>
+        /// Loads an authentic human Quick, Draw! preset sketch and runs inference.
+        /// </summary>
+        public void LoadQuickDrawPreset(string presetName)
+        {
+            if (sandboxEngine == null) return;
+            byte[] mask = sandboxEngine.GetPresetMask(presetName);
+            if (mask == null || mask.Length != ModelResolution * ModelResolution)
+            {
+                Debug.LogWarning($"[MousePaintCanvas] Preset '{presetName}' not found in catalog, fallback to clearing.");
+                ClearCanvas(true);
+                return;
+            }
+
+            ClearCanvas(false);
+            int scale = canvasSize / ModelResolution;
+
+            for (int y = 0; y < ModelResolution; y++)
+            {
+                for (int x = 0; x < ModelResolution; x++)
+                {
+                    byte b = mask[y * ModelResolution + x];
+                    if (b > 80)
+                    {
+                        FillRect(x * scale, y * scale, (x + 1) * scale, (y + 1) * scale);
+                    }
+                }
+            }
+
+            _drawTexture.SetPixels32(_texturePixels);
+            _drawTexture.Apply();
+            Generate3DVoxels();
+        }
+
+        /// <summary>
         /// Transforms canvas into normalized 2-channel representation [Channel 0: Stroke, Channel 1: SDF],
         /// displays instant holographic wireframe extrusion preview, and dispatches to Sentis.
         /// </summary>
@@ -320,6 +383,42 @@ namespace VRDraw2Voxel.Tests
             if (showHolographicWireframePreview)
             {
                 ShowHolographicWireframePreview(strokeMask);
+            }
+
+            if (activeMode == GamePlayMode.Sandbox50Class && sandboxEngine != null)
+            {
+                _statusMessage = "Inferring Universal Sandbox Prop (50+ Classes)...";
+                sandboxEngine.PredictSandboxAsync(inputBuffer2Ch, (result) =>
+                {
+                    _lastSandboxResult = result;
+                    _lastInferenceTimeMs = result.latencyMs;
+                    _lastCategoryName = result.family.ToUpper();
+                    _lastGeneratedItemName = result.label;
+
+                    int count = 0;
+                    if (result.occupancyGrid != null)
+                    {
+                        for (int i = 0; i < result.occupancyGrid.Length; i++)
+                        {
+                            if (result.occupancyGrid[i] > 0) count++;
+                        }
+                    }
+                    _lastSolidVoxelCount = count;
+
+                    if (result.isNoise)
+                    {
+                        _statusMessage = $"<color=#ff6666>[NOISE REJECTED ({result.confidence * 100f:F0}%)]</color> Input is unstructured scribble!";
+                    }
+                    else
+                    {
+                        _statusMessage = $"Sandbox: <b>{result.label}</b> ({result.confidence * 100f:F0}%) | Voxels: {count} | {result.latencyMs:F1}ms";
+                        if (coloredVoxelMesher != null)
+                        {
+                            coloredVoxelMesher.GenerateColoredMesh(result.occupancyGrid, result.voxelColors);
+                        }
+                    }
+                });
+                return;
             }
 
             if (multiTaskEngine != null)
@@ -773,99 +872,202 @@ namespace VRDraw2Voxel.Tests
         {
             // Dark Retro HUD Window
             GUI.color = Color.white;
-            GUI.Box(new Rect(10, 10, 290, 620), "");
+            GUI.Box(new Rect(10, 10, 305, 715), "");
 
-            GUI.Label(new Rect(20, 15, 270, 22), "<b>★ DRAW-2-VOXEL MULTI-CATEGORY ★</b>");
-            GUI.Label(new Rect(20, 35, 270, 20), "<color=#aaaaaa>Draw 2D sketch with mouse:</color>");
+            // 1. Header & Engine Mode Switcher
+            GUI.Label(new Rect(20, 14, 280, 20), "<b>★ DRAW-2-VOXEL AI WORKSHOP ★</b>");
+            string[] modeNames = new string[] { "★ Sandbox (50+ Cls)", "Studio (12-Cls)" };
+            int currentModeIdx = (activeMode == GamePlayMode.Sandbox50Class) ? 0 : 1;
+            int newModeIdx = GUI.Toolbar(new Rect(20, 36, 285, 24), currentModeIdx, modeNames);
+            if (newModeIdx != currentModeIdx)
+            {
+                activeMode = (newModeIdx == 0) ? GamePlayMode.Sandbox50Class : GamePlayMode.Studio12Class;
+                if (activeMode == GamePlayMode.Sandbox50Class) LoadQuickDrawPreset("Airplane");
+                else LoadPreset("Sword");
+            }
 
-            // 1. Draw Canvas Border & Texture
+            // 2. Canvas Border & Texture
+            GUI.Label(new Rect(20, 64, 280, 18), "<color=#aaaaaa><size=11>Draw 2D sketch with mouse:</size></color>");
             GUI.Box(new Rect(_canvasRect.x - 2, _canvasRect.y - 2, _canvasRect.width + 4, _canvasRect.height + 4), "");
             GUI.DrawTexture(_canvasRect, _drawTexture);
 
-            // 2. Action Controls
-            float btnY = _canvasRect.yMax + 10;
-            if (GUI.Button(new Rect(20, btnY, 124, 30), "<b>Reconstruct 3D</b>"))
+            // 3. Action Controls
+            float btnY = _canvasRect.yMax + 8;
+            if (GUI.Button(new Rect(20, btnY, 138, 28), "<b>Reconstruct 3D</b>"))
             {
                 Generate3DVoxels();
             }
 
-            if (GUI.Button(new Rect(152, btnY, 124, 30), "Clear Paint"))
+            if (GUI.Button(new Rect(166, btnY, 138, 28), "Clear Paint"))
             {
                 ClearCanvas();
             }
 
-            // 3. Live Feasibility Meter
-            btnY += 36;
+            // 4. Live Feasibility Meter
+            btnY += 32;
             AnalyzeFeasibility(out string feasLevel, out string feasTip, out Color feasColor);
             GUI.color = feasColor;
-            GUI.Label(new Rect(20, btnY, 270, 20), $"<b>● FEASIBILITY: {feasLevel}</b>");
+            GUI.Label(new Rect(20, btnY, 280, 18), $"<b>● FEASIBILITY: {feasLevel}</b>");
             GUI.color = Color.white;
-            GUI.Label(new Rect(20, btnY + 18, 270, 32), $"<size=10><color=#cccccc>{feasTip}</color></size>");
+            GUI.Label(new Rect(20, btnY + 16, 280, 26), $"<size=10><color=#cccccc>{feasTip}</color></size>");
 
-            // 4. Category Tabs
-            btnY += 46;
-            GUI.Label(new Rect(20, btnY, 270, 20), "<b>Active Category Presets:</b>");
-            btnY += 20;
-
-            string[] tabNames = new string[] { "Weapons", "Toys", "Electronics" };
-            int newTab = GUI.Toolbar(new Rect(20, btnY, 256, 26), _selectedCategoryTab, tabNames);
-            if (newTab != _selectedCategoryTab)
+            // 5. Presets
+            btnY += 42;
+            if (activeMode == GamePlayMode.Sandbox50Class)
             {
-                _selectedCategoryTab = newTab;
+                GUI.Label(new Rect(20, btnY, 280, 18), "<b>Quick, Draw! Sandbox Presets:</b>");
+                btnY += 18;
+
+                string[] sbTabs = new string[] { "Vehicles", "Food", "Animals", "Tools", "Weapons" };
+                _selectedSandboxTab = GUI.Toolbar(new Rect(20, btnY, 285, 22), _selectedSandboxTab, sbTabs);
+
+                btnY += 26;
+                if (_selectedSandboxTab == 0) // Vehicles
+                {
+                    if (GUI.Button(new Rect(20, btnY, 68, 24), "Plane")) LoadQuickDrawPreset("Airplane");
+                    if (GUI.Button(new Rect(92, btnY, 68, 24), "Car")) LoadQuickDrawPreset("Sports Car");
+                    if (GUI.Button(new Rect(164, btnY, 68, 24), "Bike")) LoadQuickDrawPreset("Bicycle");
+                    if (GUI.Button(new Rect(236, btnY, 68, 24), "Boat")) LoadQuickDrawPreset("Sailboat");
+                }
+                else if (_selectedSandboxTab == 1) // Food
+                {
+                    if (GUI.Button(new Rect(20, btnY, 68, 24), "Apple")) LoadQuickDrawPreset("Red Apple");
+                    if (GUI.Button(new Rect(92, btnY, 68, 24), "Pizza")) LoadQuickDrawPreset("Pizza Slice");
+                    if (GUI.Button(new Rect(164, btnY, 68, 24), "Donut")) LoadQuickDrawPreset("Glazed Donut");
+                    if (GUI.Button(new Rect(236, btnY, 68, 24), "IceCream")) LoadQuickDrawPreset("Ice Cream");
+                }
+                else if (_selectedSandboxTab == 2) // Animals
+                {
+                    if (GUI.Button(new Rect(20, btnY, 68, 24), "Cat")) LoadQuickDrawPreset("Cat Figurine");
+                    if (GUI.Button(new Rect(92, btnY, 68, 24), "Duck")) LoadQuickDrawPreset("Rubber Ducky");
+                    if (GUI.Button(new Rect(164, btnY, 68, 24), "Fish")) LoadQuickDrawPreset("Tropical Fish");
+                    if (GUI.Button(new Rect(236, btnY, 68, 24), "Frog")) LoadQuickDrawPreset("Tree Frog");
+                }
+                else if (_selectedSandboxTab == 3) // Tools
+                {
+                    if (GUI.Button(new Rect(20, btnY, 68, 24), "Hammer")) LoadQuickDrawPreset("War Hammer");
+                    if (GUI.Button(new Rect(92, btnY, 68, 24), "Anvil")) LoadQuickDrawPreset("Blacksmith Anvil");
+                    if (GUI.Button(new Rect(164, btnY, 68, 24), "Guitar")) LoadQuickDrawPreset("Acoustic Guitar");
+                    if (GUI.Button(new Rect(236, btnY, 68, 24), "Tree")) LoadQuickDrawPreset("Pine Tree");
+                }
+                else // Weapons & Treasures
+                {
+                    if (GUI.Button(new Rect(20, btnY, 68, 24), "Sword")) LoadQuickDrawPreset("Excalibur Sword");
+                    if (GUI.Button(new Rect(92, btnY, 68, 24), "Cannon")) LoadQuickDrawPreset("Siege Cannon");
+                    if (GUI.Button(new Rect(164, btnY, 68, 24), "Crown")) LoadQuickDrawPreset("Royal Crown");
+                    if (GUI.Button(new Rect(236, btnY, 68, 24), "Diamond")) LoadQuickDrawPreset("Magic Diamond");
+                }
+
+                // Sandbox Physics Spawning Controls
+                btnY += 28;
+                if (GUI.Button(new Rect(20, btnY, 175, 24), "<b>🎲 Drop Prop with Physics</b>"))
+                {
+                    if (sandboxEngine != null && _lastSandboxResult.occupancyGrid != null)
+                    {
+                        Vector3 dropPos = new Vector3(
+                            UnityEngine.Random.Range(-0.35f, 0.35f),
+                            0.5f,
+                            UnityEngine.Random.Range(-0.25f, 0.25f)
+                        );
+                        sandboxEngine.SpawnPhysicalProp(_lastSandboxResult, dropPos);
+                    }
+                }
+
+                int propCount = sandboxEngine != null ? sandboxEngine.SpawnedPropCount : 0;
+                if (GUI.Button(new Rect(200, btnY, 104, 24), $"🧹 Clear ({propCount})"))
+                {
+                    if (sandboxEngine != null) sandboxEngine.ClearSpawnedProps();
+                }
+            }
+            else // Studio12Class
+            {
+                GUI.Label(new Rect(20, btnY, 280, 18), "<b>Active Category Presets:</b>");
+                btnY += 18;
+
+                string[] tabNames = new string[] { "Weapons", "Toys", "Electronics" };
+                int newTab = GUI.Toolbar(new Rect(20, btnY, 285, 24), _selectedCategoryTab, tabNames);
+                if (newTab != _selectedCategoryTab)
+                {
+                    _selectedCategoryTab = newTab;
+                }
+
+                btnY += 28;
+                if (_selectedCategoryTab == 0) // Weapons
+                {
+                    if (GUI.Button(new Rect(20, btnY, 68, 24), "Sword")) LoadPreset("Sword");
+                    if (GUI.Button(new Rect(92, btnY, 68, 24), "Pistol")) LoadPreset("Pistol");
+                    if (GUI.Button(new Rect(164, btnY, 68, 24), "Blaster")) LoadPreset("Blaster");
+                    if (GUI.Button(new Rect(236, btnY, 68, 24), "Axe")) LoadPreset("Axe");
+                }
+                else if (_selectedCategoryTab == 1) // Toys
+                {
+                    if (GUI.Button(new Rect(20, btnY, 68, 24), "Teddy")) LoadPreset("Teddy Bear");
+                    if (GUI.Button(new Rect(92, btnY, 68, 24), "Duck")) LoadPreset("Rubber Duck");
+                    if (GUI.Button(new Rect(164, btnY, 68, 24), "Robot")) LoadPreset("Toy Robot");
+                    if (GUI.Button(new Rect(236, btnY, 68, 24), "Bunny")) LoadPreset("Toy Bunny");
+                }
+                else // Electronics
+                {
+                    if (GUI.Button(new Rect(20, btnY, 90, 24), "Gamepad")) LoadPreset("Gamepad");
+                    if (GUI.Button(new Rect(116, btnY, 90, 24), "Retro TV")) LoadPreset("Retro TV");
+                    if (GUI.Button(new Rect(212, btnY, 92, 24), "Game Boy")) LoadPreset("Game Boy");
+                }
             }
 
-            // 5. Category-Specific Instant Presets
-            btnY += 32;
-            if (_selectedCategoryTab == 0) // Weapons
-            {
-                if (GUI.Button(new Rect(20, btnY, 60, 24), "Sword")) LoadPreset("Sword");
-                if (GUI.Button(new Rect(84, btnY, 60, 24), "Pistol")) LoadPreset("Pistol");
-                if (GUI.Button(new Rect(148, btnY, 60, 24), "Blaster")) LoadPreset("Blaster");
-                if (GUI.Button(new Rect(212, btnY, 64, 24), "Axe")) LoadPreset("Axe");
-            }
-            else if (_selectedCategoryTab == 1) // Toys
-            {
-                if (GUI.Button(new Rect(20, btnY, 60, 24), "Teddy")) LoadPreset("Teddy Bear");
-                if (GUI.Button(new Rect(84, btnY, 60, 24), "Duck")) LoadPreset("Rubber Duck");
-                if (GUI.Button(new Rect(148, btnY, 60, 24), "Robot")) LoadPreset("Toy Robot");
-                if (GUI.Button(new Rect(212, btnY, 64, 24), "Bunny")) LoadPreset("Toy Bunny");
-            }
-            else // Electronics
-            {
-                if (GUI.Button(new Rect(20, btnY, 82, 24), "Gamepad")) LoadPreset("Gamepad");
-                if (GUI.Button(new Rect(106, btnY, 82, 24), "Retro TV")) LoadPreset("Retro TV");
-                if (GUI.Button(new Rect(192, btnY, 84, 24), "Game Boy")) LoadPreset("Game Boy");
-            }
-
-            // 6. Capability & Disclaimer Guide Toggle
-            btnY += 32;
-            string guideLabel = _showDisclaimerModal ? "Hide Capability Guide ▲" : "📖 Can this be made? Guide ▼";
-            if (GUI.Button(new Rect(20, btnY, 256, 26), guideLabel))
+            // 6. Capability Guide Toggle
+            btnY += 30;
+            string guideLabel = _showDisclaimerModal ? "Hide Workshop Guide ▲" : "📖 Workshop Capability Guide ▼";
+            if (GUI.Button(new Rect(20, btnY, 285, 24), guideLabel))
             {
                 _showDisclaimerModal = !_showDisclaimerModal;
             }
 
-            // 7. Status & Achievement Display
-            btnY += 32;
-            autoGenerateOnRelease = GUI.Toggle(new Rect(20, btnY, 250, 18), autoGenerateOnRelease, " Live Reconstruct on Mouse Up");
+            // 7. Status & Results
+            btnY += 28;
+            autoGenerateOnRelease = GUI.Toggle(new Rect(20, btnY, 280, 18), autoGenerateOnRelease, " Live Reconstruct on Mouse Up");
 
-            btnY += 22;
-            if (multiTaskEngine != null && _detectedCategory != ReconstructedCategory.Unknown)
+            btnY += 20;
+            if (activeMode == GamePlayMode.Sandbox50Class)
             {
-                string catBadge = _isOutOfDistribution
-                    ? "<color=#ff5555><b>[OOD REJECTED]</b></color>"
-                    : $"<color=#55ff88><b>{_detectedCategory}</b></color> ({_categoryConfidence * 100f:F0}%)";
-                string viewBadge = $"<color=#55ccff><b>{_detectedView}</b></color> ({_viewConfidence * 100f:F0}%)";
-                GUI.Label(new Rect(20, btnY, 260, 20), $"AI Class: {catBadge} | View: {viewBadge}");
-                btnY += 20;
+                if (!string.IsNullOrEmpty(_lastSandboxResult.label))
+                {
+                    string catBadge = _lastSandboxResult.isNoise
+                        ? "<color=#ff5555><b>[NOISE REJECTED]</b></color>"
+                        : $"<color=#55ff88><b>{_lastSandboxResult.label}</b></color> ({_lastSandboxResult.confidence * 100f:F0}%) [Family: {_lastSandboxResult.family}]";
+                    GUI.Label(new Rect(20, btnY, 280, 18), $"<size=11>AI Class: {catBadge}</size>");
+                    btnY += 18;
+
+                    if (_lastSandboxResult.top5 != null && _lastSandboxResult.top5.Count > 1)
+                    {
+                        string topText = "";
+                        for (int k = 0; k < Mathf.Min(3, _lastSandboxResult.top5.Count); k++)
+                        {
+                            topText += $"{k + 1}. {_lastSandboxResult.top5[k].Key} ({_lastSandboxResult.top5[k].Value * 100f:F0}%) ";
+                        }
+                        GUI.Label(new Rect(20, btnY, 280, 16), $"<size=9><color=#88ccff>Top: {topText}</color></size>");
+                        btnY += 16;
+                    }
+                }
+            }
+            else // Studio12Class
+            {
+                if (multiTaskEngine != null && _detectedCategory != ReconstructedCategory.Unknown)
+                {
+                    string catBadge = _isOutOfDistribution
+                        ? "<color=#ff5555><b>[OOD REJECTED]</b></color>"
+                        : $"<color=#55ff88><b>{_detectedCategory}</b></color> ({_categoryConfidence * 100f:F0}%)";
+                    string viewBadge = $"<color=#55ccff><b>{_detectedView}</b></color> ({_viewConfidence * 100f:F0}%)";
+                    GUI.Label(new Rect(20, btnY, 280, 18), $"AI Class: {catBadge} | View: {viewBadge}");
+                    btnY += 18;
+                }
             }
 
-            GUI.Label(new Rect(20, btnY, 260, 36), $"<color=#ffdd66>★ {_lastCategoryName}: {_lastGeneratedItemName}</color>\n<size=10>{_statusMessage}</size>");
+            GUI.Label(new Rect(20, btnY, 280, 36), $"<color=#ffdd66>★ {_lastCategoryName}: {_lastGeneratedItemName}</color>\n<size=10>{_statusMessage}</size>");
 
             // 8. Player Capability & Disclaimer Guide Modal
             if (_showDisclaimerModal)
             {
-                DrawDisclaimerGuideWindow(new Rect(310, 10, 440, 580));
+                DrawDisclaimerGuideWindow(new Rect(330, 10, 470, 640));
             }
         }
 
@@ -874,29 +1076,46 @@ namespace VRDraw2Voxel.Tests
             GUI.Box(windowRect, "");
             float y = windowRect.y + 12;
 
-            GUI.Label(new Rect(windowRect.x + 15, y, 410, 25), "<b>★ CATEGORY CAPABILITY & DISCLAIMER GUIDE ★</b>");
+            GUI.Label(new Rect(windowRect.x + 15, y, 440, 25), "<b>★ AI WORKSHOP & CAPABILITY GUIDE ★</b>");
             y += 26;
 
-            GUI.Label(new Rect(windowRect.x + 15, y, 410, 20), "<color=#88ffaa><b>CAN THIS CATEGORY / ITEM BE MADE?</b></color>");
-            y += 22;
+            GUI.Label(new Rect(windowRect.x + 15, y, 440, 20), "<color=#88ffaa><b>MODE 1: UNIVERSAL SANDBOX (50+ QUICK, DRAW! CLASSES)</b></color>");
+            y += 20;
 
-            string guideText = 
-                "<b>1. WEAPONS (Fully Supported):</b>\n" +
-                "  • <i>Melee</i>: Broadswords, katanas, daggers, battleaxes, war hammers, clubs, shields.\n" +
-                "  • <i>Firearms & Guns</i>: Handguns, pistols, rifles, shotguns, sci-fi blasters, ray guns.\n\n" +
-                "<b>2. TOYS & CREATURES (Toy-Scale Shapes):</b>\n" +
-                "  • Living beings stylized into chunky toy shapes: Teddy bears, rubber ducks, toy robots, bunnies, toy karts.\n\n" +
-                "<b>3. ELECTRONICS & GADGETS (Fully Supported):</b>\n" +
-                "  • Game controllers, retro handheld consoles (Game Boy), vintage CRT TVs, desktop monitors, cameras.\n\n" +
-                "<color=#ffdd66><b>FEASIBILITY & DRAWING RULES:</b></color>\n" +
-                "  ✔ <b>WORKS BEST:</b> Closed contours, solid filled silhouettes, and distinct profiles (3+ px stroke width).\n" +
-                "  ⚠️ <b>NEEDS THICKNESS:</b> Thin rods, antennae, cords (draw with at least 3-4 px width).\n" +
-                "  ✖ <b>UNSUPPORTED:</b> Hollow wireframes, transparent glass, unattached floating single dots, photorealistic human faces.\n\n" +
-                "<i>Tip: The AI model interprets your 2D stroke as a frontal orthographic projection and sculpts full 360° volume!</i>";
+            string sandboxText = 
+                "• <b>Vehicles:</b> Airplane, Helicopter, Sports Car, Bicycle, Sailboat, Skateboard.\n" +
+                "• <b>Food & Cuisine:</b> Red Apple, Banana, Pizza Slice, Glazed Donut, Ice Cream, Burger.\n" +
+                "• <b>Animals & Creatures:</b> Rubber Ducky, Cat, Dog, Grizzly Bear, Tropical Fish, Songbird, Tree Frog.\n" +
+                "• <b>Tools & Instruments:</b> War Hammer, Screwdriver, Hand Saw, Pliers, Flashlight, Umbrella, Key, Anvil, Acoustic Guitar, Wall Clock, Chair.\n" +
+                "• <b>Nature & Elements:</b> Pine Tree, Flower, Cactus, Mushroom, Campfire, Mountain, Cloud, Sun, Star.\n" +
+                "• <b>Weapons & Armor:</b> Broadsword, Battleaxe, Rifle, Cannon, Dagger, Boomerang, Knight Helmet, Royal Crown, Magic Diamond.\n" +
+                "• <b>Interactive Physics:</b> Click <b>'🎲 Drop Prop'</b> to spawn physical rigidbodies that tumble and collide!";
 
-            GUI.Label(new Rect(windowRect.x + 15, y, 410, 380), $"<size=11>{guideText}</size>");
+            GUI.Label(new Rect(windowRect.x + 15, y, 440, 190), $"<size=10>{sandboxText}</size>");
+            y += 195;
 
-            if (GUI.Button(new Rect(windowRect.x + 15, windowRect.yMax - 38, 410, 28), "<b>Got it! Close Guide</b>"))
+            GUI.Label(new Rect(windowRect.x + 15, y, 440, 20), "<color=#88ffaa><b>MODE 2: CURATED STUDIO (12-CLASS MULTI-TASK NET)</b></color>");
+            y += 20;
+
+            string studioText =
+                "• Hand-sculpted 3D voxel models across Weapons (Sword, Shield, Blaster, Axe), Toys (Teddy Bear, Rubber Duck, Toy Robot, Bunny), and Electronics (Gamepad, Retro TV, Game Boy).\n" +
+                "• <b>Tri-View Multi-Task:</b> Classifies category, predicts 3D camera viewpoint (Front/Left/Top), and blends latent codes (e.g., Sword + Axe hybrid).\n" +
+                "• <b>Out-Of-Distribution Rejection:</b> Scribbles and random noise are automatically detected and filtered.";
+
+            GUI.Label(new Rect(windowRect.x + 15, y, 440, 130), $"<size=10>{studioText}</size>");
+            y += 135;
+
+            GUI.Label(new Rect(windowRect.x + 15, y, 440, 20), "<color=#ffdd66><b>DRAWING TIPS & FEASIBILITY:</b></color>");
+            y += 20;
+
+            string tipsText =
+                "✔ <b>Best Results:</b> Closed contours, distinct silhouettes, 3-4px stroke thickness.\n" +
+                "⚠️ <b>Outline sketches</b> in Sandbox mode are automatically closed and given smooth spherical/tubular volume!\n" +
+                "✖ <b>Avoid:</b> Unconnected scattered dots, single hairline scratches (<1px), or unclosed scribble webs.";
+
+            GUI.Label(new Rect(windowRect.x + 15, y, 440, 90), $"<size=10>{tipsText}</size>");
+
+            if (GUI.Button(new Rect(windowRect.x + 15, windowRect.yMax - 36, 440, 28), "<b>Got it! Close Workshop Guide</b>"))
             {
                 _showDisclaimerModal = false;
             }
